@@ -1,0 +1,346 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta
+        http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self' https://unpkg.com; style-src 'self' 'unsafe-inline' https://unpkg.com; connect-src 'self' http://127.0.0.1:8000 http://localhost:8000; img-src 'self' data: blob:; worker-src blob:; object-src 'none'; base-uri 'none'; form-action 'none'"
+    >
+    <meta
+        name="description"
+        content="Local synthetic demonstration of H3-level Ottawa infrastructure stress risk."
+    >
+    <title>Ottawa Infrastructure Stress — Synthetic Demo</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>💧</text></svg>">
+    <link
+        rel="stylesheet"
+        href="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.css"
+        integrity="sha384-uTttxo/aOKbdE5RlD/SPzSDoDmNvGlUYPjONi2MN/b7c9HPSvW07OIuyP7uL6jxK"
+        crossorigin="anonymous"
+    >
+    <link rel="stylesheet" href="styles.css">
+    <script
+        defer
+        src="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.js"
+        integrity="sha384-5+cfbwT0iiub6VsQAdn6yz16nr6sDiQoHx6tm4O8OVYXHYOxcffFmCJBL0dgdvGp"
+        crossorigin="anonymous"
+    ></script>
+    <script defer src="app.js"></script>
+</head>
+<body>
+    <header class="site-header">
+        <div>
+            <p class="eyebrow">Local educational project</p>
+            <h1>Ottawa infrastructure stress</h1>
+            <p class="subtitle">Aggregate H3 risk explorer · 48-hour demonstration horizon</p>
+        </div>
+        <div class="header-actions">
+            <button id="open-guide" class="guide-toggle-btn" type="button" aria-haspopup="dialog">
+                📖 How to Read &amp; Interpret
+            </button>
+            <div id="api-status" class="status status-loading" role="status" aria-live="polite">
+                Connecting to local API…
+            </div>
+        </div>
+    </header>
+
+    <div class="warning-banner" role="note">
+        <strong>Synthetic demonstration.</strong>
+        This is not a live municipal forecast and must not be used for emergency,
+        maintenance, or public-safety decisions.
+    </div>
+
+    <main class="app-shell">
+        <aside class="control-panel" aria-label="Risk map controls">
+            <section class="panel-section">
+                <div class="section-heading">
+                    <h2>Weather inputs</h2>
+                    <span id="weather-mode" class="tag">Loading</span>
+                </div>
+                <dl class="metric-grid">
+                    <div>
+                        <dt>Temperature</dt>
+                        <dd id="weather-temperature">—</dd>
+                    </div>
+                    <div>
+                        <dt>Heat index</dt>
+                        <dd id="weather-heat-index">—</dd>
+                    </div>
+                    <div>
+                        <dt>Dry days</dt>
+                        <dd id="weather-dry-days">—</dd>
+                    </div>
+                    <div>
+                        <dt>Rain, 48 h</dt>
+                        <dd id="weather-rainfall">—</dd>
+                    </div>
+                </dl>
+                <p id="weather-observed-at" class="supporting-text">No weather row loaded.</p>
+            </section>
+
+            <section class="panel-section">
+                <h2>Visible aggregates</h2>
+                <dl class="metric-grid compact">
+                    <div>
+                        <dt>H3 cells</dt>
+                        <dd id="cell-count">0</dd>
+                    </div>
+                    <div>
+                        <dt>High band</dt>
+                        <dd id="high-count">0</dd>
+                    </div>
+                    <div>
+                        <dt>Average</dt>
+                        <dd id="average-risk">—</dd>
+                    </div>
+                    <div>
+                        <dt>Maximum</dt>
+                        <dd id="maximum-risk">—</dd>
+                    </div>
+                </dl>
+                <p id="model-provenance" class="supporting-text">Model provenance unavailable.</p>
+            </section>
+
+            <section class="panel-section">
+                <h2>Map canvas theme</h2>
+                <div class="view-selector" role="radiogroup" aria-label="Base canvas theme">
+                    <button id="view-neutral" class="view-btn active" type="button" role="radio" aria-checked="true" data-view="neutral">
+                        🗺️ Neutral
+                    </button>
+                    <button id="view-dark" class="view-btn" type="button" role="radio" aria-checked="false" data-view="dark">
+                        🌙 Dark
+                    </button>
+                    <button id="view-slate" class="view-btn" type="button" role="radio" aria-checked="false" data-view="slate">
+                        🏙️ Slate
+                    </button>
+                    <button id="view-terrain" class="view-btn" type="button" role="radio" aria-checked="false" data-view="terrain">
+                        🌿 Terrain
+                    </button>
+                </div>
+
+                <label for="risk-filter">
+                    Minimum risk score
+                    <output id="risk-filter-value" for="risk-filter">0%</output>
+                </label>
+                <input id="risk-filter" type="range" min="0" max="90" step="5" value="0">
+
+                <label for="opacity-filter">
+                    Hexagon opacity
+                    <output id="opacity-filter-value" for="opacity-filter">70%</output>
+                </label>
+                <input id="opacity-filter" type="range" min="20" max="100" step="5" value="70">
+
+                <div class="legend" aria-label="Risk score legend">
+                    <span>Low &lt; 30%</span>
+                    <span>Medium 30–69%</span>
+                    <span>High ≥ 70%</span>
+                </div>
+            </section>
+
+            <section class="panel-section scenario-section">
+                <div class="section-heading">
+                    <h2>What-if scenario</h2>
+                    <span class="tag tag-neutral">Optional</span>
+                </div>
+                <p class="supporting-text">
+                    Recalculate demo scores with bounded city-wide assumptions.
+                </p>
+                <label for="scenario-temperature">
+                    Temperature
+                    <output id="scenario-temperature-value" for="scenario-temperature">34 °C</output>
+                </label>
+                <input id="scenario-temperature" type="range" min="20" max="42" step="0.5" value="34">
+
+                <label for="scenario-humidity">
+                    Relative humidity
+                    <output id="scenario-humidity-value" for="scenario-humidity">65%</output>
+                </label>
+                <input id="scenario-humidity" type="range" min="20" max="95" step="5" value="65">
+
+                <label for="scenario-dry-days">
+                    Consecutive dry days
+                    <output id="scenario-dry-days-value" for="scenario-dry-days">6</output>
+                </label>
+                <input id="scenario-dry-days" type="range" min="0" max="30" step="1" value="6">
+
+                <div class="button-row">
+                    <button id="apply-scenario" type="button">Apply scenario</button>
+                    <button id="reset-scenario" class="secondary-button" type="button">Reset</button>
+                </div>
+            </section>
+
+            <section class="panel-section">
+                <h2>Model status</h2>
+                <p id="model-warning" class="supporting-text">
+                    Synthetic target metrics do not measure real-world performance.
+                </p>
+                <dl class="detail-list">
+                    <div><dt>PR-AUC</dt><dd id="metric-pr-auc">—</dd></div>
+                    <div><dt>F1 at threshold</dt><dd id="metric-f1">—</dd></div>
+                    <div><dt>Decision threshold</dt><dd id="metric-threshold">—</dd></div>
+                </dl>
+            </section>
+
+            <div id="error-message" class="error-message hidden" role="alert"></div>
+        </aside>
+
+        <section class="map-panel" aria-label="Ottawa H3 aggregate risk map">
+            <div class="map-top-bar">
+                <span class="quick-jump-label">📍 Quick jump:</span>
+                <div class="quick-jump-buttons">
+                    <button class="jump-btn" type="button" data-lng="-75.6972" data-lat="45.4215" data-zoom="13.2">
+                        🏛️ Downtown Core
+                    </button>
+                    <button class="jump-btn" type="button" data-lng="-75.8986" data-lat="45.3188" data-zoom="13.0">
+                        🌲 Kanata Suburbs
+                    </button>
+                    <button class="jump-btn" type="button" data-lng="-75.5200" data-lat="45.4750" data-zoom="13.0">
+                        🏘️ Orléans East
+                    </button>
+                    <button class="jump-btn" type="button" data-lng="-75.7600" data-lat="45.3200" data-zoom="12.8">
+                        🌳 Nepean / Greenbelt
+                    </button>
+                </div>
+            </div>
+            <div id="map" aria-label="Interactive risk map"></div>
+            <div id="loading-message" class="map-message" role="status" aria-live="polite">
+                Loading aggregate H3 cells…
+            </div>
+            <div class="map-note">
+                Locally styled vector canvas. No third-party tile services or location requests.
+            </div>
+        </section>
+
+        <aside id="cell-details" class="detail-panel" aria-label="Selected H3 cell">
+            <p class="eyebrow">Selected aggregate</p>
+            <h2>H3 cell details</h2>
+            <p id="selected-h3" class="mono">Select a hexagon on the map.</p>
+            <div class="score-card">
+                <span id="selected-level">No score</span>
+                <strong id="selected-score">—</strong>
+            </div>
+
+            <div id="density-badge-container" class="density-badge-row hidden">
+                <span id="density-badge" class="badge">Urban Density</span>
+                <span id="demand-badge" class="badge">Asset Density</span>
+            </div>
+
+            <dl class="detail-list">
+                <div><dt>Water mains</dt><dd id="selected-water">—</dd></div>
+                <div><dt>Roads</dt><dd id="selected-roads">—</dd></div>
+                <div><dt>Building count</dt><dd id="selected-buildings">—</dd></div>
+                <div><dt>Median year built</dt><dd id="selected-year">—</dd></div>
+                <div><dt>Pre-1980 building share</dt><dd id="selected-vintage">—</dd></div>
+            </dl>
+
+            <div id="vintage-breakdown" class="vintage-progress-container hidden">
+                <div class="vintage-progress-labels">
+                    <span>Pre-1980 Buildings (<strong id="vintage-pre-pct">0%</strong>)</span>
+                    <span>Modern (<strong id="vintage-post-pct">100%</strong>)</span>
+                </div>
+                <div class="vintage-progress-bar">
+                    <div id="vintage-bar-fill" class="vintage-bar-fill" style="width: 0%;"></div>
+                </div>
+            </div>
+
+            <p id="selected-provenance" class="supporting-text"></p>
+        </aside>
+    </main>
+
+    <dialog id="guide-dialog" class="guide-dialog" aria-labelledby="guide-title">
+        <div class="guide-dialog-content">
+            <div class="guide-dialog-header">
+                <div>
+                    <p class="eyebrow">Interactive Explainer</p>
+                    <h2 id="guide-title">Understanding the Ottawa Infrastructure Stress Simulation</h2>
+                </div>
+                <button id="close-guide" class="dialog-close-btn" type="button" aria-label="Close guide">✕</button>
+            </div>
+
+            <div class="guide-dialog-body">
+                <section class="guide-card">
+                    <h3>1. The Domain: Why Summer Infrastructure Stress?</h3>
+                    <p>
+                        While winter pipe freezes are well known, <strong>summer heatwaves and dry spells</strong> create critical soil and hydraulic stress in the Ottawa region:
+                    </p>
+                    <ul>
+                        <li><strong>Leda Clay Soil Shrinkage:</strong> Ottawa sits on sensitive marine clay that desiccates and shrinks during prolonged dry spells, shifting underground soils and exerting shear forces on pipe networks.</li>
+                        <li><strong>Vintage Building &amp; Infrastructure Proxy:</strong> Older neighborhoods developed before 1980 typically correlate with legacy cast-iron and ductile-iron utility installations that are more brittle under ground settlement.</li>
+                        <li><strong>Atmospheric &amp; Demand Strain:</strong> Sustained high heat indexes accelerate evaporation and drive high municipal water distribution demand.</li>
+                    </ul>
+                    <p class="guide-highlight">
+                        <strong>Project Purpose:</strong> Provide an extensible educational simulation and machine learning pipeline demonstrating how geospatial aggregation (Uber H3) and environmental features can model infrastructure vulnerability.
+                    </p>
+                </section>
+
+                <section class="guide-card">
+                    <h3>2. How to Read the Map</h3>
+                    <p>
+                        The map aggregates Ottawa into <strong>Uber H3 hexagons</strong> (Resolution 8, ~0.73 km² per cell — neighborhood block resolution).
+                    </p>
+                    <div class="guide-risk-bands">
+                        <div class="risk-band-item band-low">
+                            <span class="badge badge-low">Low (&lt; 30%)</span>
+                            <p><strong>Baseline stability.</strong> Low linear asset density, modern building vintage, or mild environmental conditions.</p>
+                        </div>
+                        <div class="risk-band-item band-med">
+                            <span class="badge badge-med">Medium (30–69%)</span>
+                            <p><strong>Moderate stress.</strong> Moderate building age, increased linear pipe exposure, or emerging dry weather.</p>
+                        </div>
+                        <div class="risk-band-item band-high">
+                            <span class="badge badge-high">High (≥ 70%)</span>
+                            <p><strong>Elevated vulnerability hotspot.</strong> High concentration of pre-1980 legacy structures combined with severe dry/heat conditions.</p>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="guide-card">
+                    <h3>3. Key Feature Inputs Explained</h3>
+                    <div class="guide-grid">
+                        <div class="guide-grid-item">
+                            <h4>🚰 Water Mains (km)</h4>
+                            <p>Total linear kilometers of water distribution mains within the H3 cell.</p>
+                        </div>
+                        <div class="guide-grid-item">
+                            <h4>🏛️ Pre-1980 Building Vintage (%)</h4>
+                            <p>Proportion of building footprints constructed before 1980, serving as an urban age proxy.</p>
+                        </div>
+                        <div class="guide-grid-item">
+                            <h4>🌡️ Heat Index (°C)</h4>
+                            <p>Atmospheric heat metric combining temperature and relative humidity.</p>
+                        </div>
+                        <div class="guide-grid-item">
+                            <h4>☀️ Consecutive Dry Days</h4>
+                            <p>Cumulative days without precipitation (&lt; 1 mm), correlating with soil desiccation.</p>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="guide-card">
+                    <h3>4. Scenario Simulator ("What-if")</h3>
+                    <ol class="guide-steps">
+                        <li>Locate the <strong>What-if scenario</strong> panel on the left sidebar.</li>
+                        <li>Adjust the <strong>Temperature</strong> and <strong>Consecutive dry days</strong> sliders.</li>
+                        <li>Click <strong>Apply scenario</strong> to recompute risk scores across the visible grid.</li>
+                        <li>Click any hexagon on the map to inspect its infrastructure features.</li>
+                    </ol>
+                </section>
+
+                <section class="guide-card guide-card-muted">
+                    <h3>5. Simulation Notice &amp; Data Provenance</h3>
+                    <p>
+                        This system operates in <strong>synthetic simulation mode</strong>. Training targets and mock features are generated for local offline development. It is an educational engineering prototype, not an operational municipal dispatch tool.
+                    </p>
+                </section>
+            </div>
+        </div>
+    </dialog>
+
+    <footer class="site-footer">
+        <span>Map rendering: MapLibre GL JS (BSD-3-Clause).</span>
+        <span>No analytics, cookies, paid tokens, or third-party map tiles.</span>
+        <span>Source review: repository DATA_LICENSES.md.</span>
+    </footer>
+</body>
+</html>
