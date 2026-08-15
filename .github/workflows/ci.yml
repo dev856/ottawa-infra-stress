@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgis/postgis:16-3.4
+        env:
+          POSTGRES_DB: ottawa_infra
+          POSTGRES_USER: ci_user
+          POSTGRES_PASSWORD: ci_only_password_not_for_deployment
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ci_user -d ottawa_infra"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATA_SOURCE_MODE: mock
+      TARGET_MODE: synthetic
+      POSTGRES_HOST: 127.0.0.1
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ottawa_infra
+      POSTGRES_USER: ci_user
+      POSTGRES_PASSWORD: ci_only_password_not_for_deployment
+      MODEL_PATH: models/infra_stress_model.joblib
+      API_HOST: 127.0.0.1
+      API_PORT: 8000
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install pinned dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Initialize PostGIS schema
+        env:
+          PGPASSWORD: ci_only_password_not_for_deployment
+        run: psql -h 127.0.0.1 -U ci_user -d ottawa_infra -v ON_ERROR_STOP=1 -f sql/init.sql
+
+      - name: Check database readiness
+        run: python src/setup_db.py
+
+      - name: Run tests with branch coverage
+        run: >-
+          python -m pytest -q
+          --cov=src --cov=api
+          --cov-report=term-missing
+          --cov-report=xml
+
+      - name: Run Ruff
+        run: python -m ruff check src tests api run_pipeline.py
+
+      - name: Run MyPy
+        run: python -m mypy src api run_pipeline.py
+
+      - name: Audit pinned runtime dependencies
+        run: python -m pip_audit -r requirements.txt --strict
+
+      - name: Generate and validate dependency licence report
+        run: >-
+          python -m piplicenses
+          --from=mixed
+          --format=markdown
+          --fail-on=UNKNOWN
+          --output-file=dependency-licenses.md
+
+      - name: Upload quality reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-reports
+          path: |
+            coverage.xml
+            dependency-licenses.md

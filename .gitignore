@@ -24,7 +24,7 @@ share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-MANIFEST
+# docs/ is tracked
 
 # PyInstaller
 #   Usually these files are written by a python script from a template
@@ -216,3 +216,44 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project specific
+.env
+.env.local
+*.pkl
+*.parquet
+data/
+models/
+logs/
+*.log
+.pytest_cache/
+.pytest-tmp-*/
+.audit-cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+
+# Internal planning, scratch, and audit records (kept locally, excluded from git)
+docs/
+docs_internal/
+AGENTS.md
+ARCHITECTURE.md
+CONTRIBUTING.md
+DATA_LICENSES.md
+DECISIONS.md
+DEPENDENCIES.md
+GLOSSARY.md
+IMPLEMENTATION_PLAN.md
+ONBOARDING.md
+OPEN_QUESTIONS.md
+PRIVACY_NOTES.md
+PROJECT_CONTEXT.md
+PROJECT_DETAILS.md
+REFACTOR_PLAN.md
+SECURITY_REVIEW.md
+TASKS.md
+USER_GUIDE.md

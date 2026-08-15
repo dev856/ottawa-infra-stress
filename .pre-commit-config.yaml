@@ -1,0 +1,21 @@
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: Ruff check
+        entry: python -m ruff check src tests api run_pipeline.py
+        language: system
+        pass_filenames: false
+
+      - id: mypy
+        name: MyPy
+        entry: python -m mypy src api run_pipeline.py
+        language: system
+        pass_filenames: false
+
+      - id: pytest
+        name: Pytest
+        entry: python -m pytest -q
+        language: system
+        pass_filenames: false
+        stages: [pre-push]

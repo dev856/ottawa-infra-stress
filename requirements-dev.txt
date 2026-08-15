@@ -1,0 +1,10 @@
+# Install after requirements.txt for local development and CI.
+pytest==9.1.0
+pytest-cov==7.1.0
+httpx==0.28.1
+ruff==0.16.0
+mypy==2.3.0
+types-requests==2.33.0.20260712
+pre-commit==4.6.2
+pip-audit==2.10.1
+pip-licenses==5.5.5
