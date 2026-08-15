@@ -1,0 +1,58 @@
+{
+  "objectIdFieldName": "objectid",
+  "exceededTransferLimit": false,
+  "features": [
+    {
+      "attributes": {
+        "objectid": 2001,
+        "reqtype": "WATER MAIN BREAK",
+        "category": "WATER",
+        "createddate": 1688169600000,
+        "description": "Flooding from cracked cast iron main"
+      },
+      "geometry": {
+        "x": -75.6972,
+        "y": 45.4215
+      }
+    },
+    {
+      "attributes": {
+        "objectid": 2002,
+        "reqtype": "WATER SERVICE",
+        "category": "WATER",
+        "createddate": 1688256000000,
+        "description": "Resident reports water leak on main street"
+      },
+      "geometry": {
+        "x": -75.7001,
+        "y": 45.4180
+      }
+    },
+    {
+      "attributes": {
+        "objectid": 2003,
+        "reqtype": "GRAFFITI REMOVAL",
+        "category": "BYLAW",
+        "createddate": 1688342400000,
+        "description": "Graffiti on park bench"
+      },
+      "geometry": {
+        "x": -75.6950,
+        "y": 45.4250
+      }
+    },
+    {
+      "attributes": {
+        "objectid": 2004,
+        "reqtype": "MAIN BREAK",
+        "category": "WATER",
+        "createddate": 1688428800000,
+        "description": "Pressure drop and broken water line"
+      },
+      "geometry": {
+        "x": -75.6880,
+        "y": 45.4190
+      }
+    }
+  ]
+}

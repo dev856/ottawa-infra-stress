@@ -1,0 +1,32 @@
+{
+  "objectIdFieldName": "objectid",
+  "exceededTransferLimit": true,
+  "features": [
+    {
+      "attributes": {
+        "objectid": 1001,
+        "reqtype": "WATER MAIN BREAK",
+        "category": "WATER",
+        "createddate": 1688169600000,
+        "description": "Severe water main rupture flooding street"
+      },
+      "geometry": {
+        "x": -75.6982,
+        "y": 45.4211
+      }
+    },
+    {
+      "attributes": {
+        "objectid": 1002,
+        "reqtype": "WATER LEAK",
+        "category": "WATER",
+        "createddate": 1688256000000,
+        "description": "Leaking service line near hydrant"
+      },
+      "geometry": {
+        "x": -75.7012,
+        "y": 45.4195
+      }
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "objectIdFieldName": "objectid",
+  "exceededTransferLimit": false,
+  "features": [
+    {
+      "attributes": {
+        "objectid": 1003,
+        "reqtype": "POTHOLE",
+        "category": "ROADS",
+        "createddate": 1688342400000,
+        "description": "Pothole on roadway"
+      },
+      "geometry": {
+        "x": -75.6901,
+        "y": 45.4244
+      }
+    }
+  ]
+}
