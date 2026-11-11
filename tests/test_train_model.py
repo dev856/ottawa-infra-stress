@@ -1,4 +1,4 @@
-"""Tests for temporal model training and artifact behavior."""
+"""Tests for the request closing-time model."""
 
 import numpy as np
 import pandas as pd
@@ -6,115 +6,127 @@ import pytest
 
 from src.errors import DataValidationError
 from src.train_model import (
-    TARGET_COLUMN,
-    assemble_feature_matrix,
-    create_target_variable,
-    evaluate_model,
-    get_feature_columns,
-    select_decision_threshold,
-    temporal_train_test_split,
-    train_lightgbm,
+    MATURITY_DAYS,
+    TEST_DAYS,
+    evaluate,
+    load_requests,
+    model_inputs,
+    split_by_date,
+    train,
+    type_lookup,
 )
 
 
-def make_temporal_dataset(days: int = 30, cells: int = 4) -> pd.DataFrame:
-    """Create deterministic multi-cell daily examples with both synthetic classes."""
-    records: list[dict[str, object]] = []
-    for day in range(days):
-        for cell in range(cells):
-            records.append(
+def make_requests(days: int = 400, per_day: int = 30) -> pd.DataFrame:
+    """Return requests where noise closes in ~1 day and potholes in ~30, slower in ward 2."""
+    rng = np.random.default_rng(0)
+    rows = []
+    for day in pd.date_range("2025-01-01", periods=days, freq="D"):
+        for _ in range(per_day):
+            request_type = rng.choice(["Noise", "Pothole"])
+            ward = int(rng.integers(1, 3))
+            mean = (1 if request_type == "Noise" else 30) * (2 if ward == 2 else 1)
+            rows.append(
                 {
-                    "timestamp": pd.Timestamp("2024-05-01") + pd.Timedelta(days=day),
-                    "h3_index": f"cell-{cell}",
-                    "line_length_km_water": float(cell + 1),
-                    "line_length_km_road": float(cell + 2),
-                    "building_count": 10 + cell,
-                    "pct_pre_1980": 0.2 + cell * 0.2,
-                    "heat_index_c": 24.0 + (day % 10),
-                    "consecutive_dry_days": float(day % 6),
-                    "rainfall_48h": 0.0 if day % 5 else 5.0,
+                    "opened": day,
+                    "closed": day + pd.Timedelta(days=int(rng.poisson(mean))),
+                    "type": request_type,
+                    "ward": ward,
+                    "channel": "Web",
+                    "status": "Resolved",
                 }
             )
-    return pd.DataFrame(records)
+    requests = pd.DataFrame(rows)
+    requests["days_to_close"] = (requests["closed"] - requests["opened"]).dt.days
+    return requests
 
 
-def test_assemble_feature_matrix_is_temporal_cross_join() -> None:
-    """Every H3 cell receives every daily weather snapshot."""
-    infrastructure = pd.DataFrame(
+def test_load_requests_adds_days_to_close(tmp_path) -> None:
+    path = tmp_path / "requests.csv.gz"
+    pd.DataFrame(
         {
-            "h3_index": ["a", "b"],
-            "centroid_lat": [45.4, 45.5],
-            "centroid_lon": [-75.7, -75.8],
-            "line_length_km_water": [1.0, 2.0],
+            "opened": ["2025-01-01", "2025-01-02"],
+            "closed": ["2025-01-04", None],
+            "category": ["A", "B"],
+            "type": ["X", "Y"],
+            "ward": [1, None],
+            "channel": ["Web", "Phone"],
+            "status": ["Resolved", "Active"],
         }
+    ).to_csv(path, index=False)
+
+    requests = load_requests(path)
+
+    assert requests["days_to_close"].iloc[0] == 3
+    assert pd.isna(requests["days_to_close"].iloc[1])
+
+
+def test_split_holds_out_mature_recent_requests_and_keeps_open_ones_in_test() -> None:
+    """Too-recent requests are dropped; still-open mature ones stay in test only."""
+    requests = make_requests()
+    end = requests["opened"].max()
+    open_day = end - pd.Timedelta(days=MATURITY_DAYS + 5)
+    requests.loc[requests["opened"] == open_day, ["closed", "days_to_close"]] = [pd.NaT, np.nan]
+    requests.loc[requests.index[:5], "status"] = "Cancelled"
+
+    train_rows, test_rows = split_by_date(requests)
+
+    assert train_rows["days_to_close"].notna().all()
+    assert test_rows["days_to_close"].isna().any()
+    assert test_rows["opened"].max() <= end - pd.Timedelta(days=MATURITY_DAYS)
+    assert test_rows["opened"].min() >= end - pd.Timedelta(days=MATURITY_DAYS + TEST_DAYS)
+    assert (train_rows["status"] != "Cancelled").all()
+
+
+def test_split_rejects_too_little_history() -> None:
+    with pytest.raises(DataValidationError, match="Not enough history"):
+        split_by_date(make_requests(days=100))
+
+
+def test_unseen_categories_become_missing_not_errors() -> None:
+    inputs = model_inputs(
+        pd.DataFrame(
+            {
+                "type": ["New"],
+                "ward": [9],
+                "channel": ["Fax"],
+                "opened": [pd.Timestamp("2025-01-06")],
+            }
+        ),
+        {"type": ["Noise"], "ward": ["1"], "channel": ["Web"]},
     )
-    weather = pd.DataFrame(
-        {
-            "timestamp": pd.date_range("2024-01-01", periods=10, freq="D"),
-            "heat_index_c": np.arange(10, dtype=float),
-        }
-    )
-
-    result = assemble_feature_matrix(infrastructure, weather)
-
-    assert len(result) == 20
-    assert result["timestamp"].nunique() == 10
+    assert inputs[["type", "ward", "channel"]].isna().all(axis=None)
+    assert inputs["weekday"].iloc[0] == 0
 
 
-def test_create_target_variable_is_explicitly_binary() -> None:
-    """Synthetic mode creates a deterministic binary label."""
-    result = create_target_variable(make_temporal_dataset(), mode="synthetic")
-    assert set(result[TARGET_COLUMN].unique()) == {0, 1}
+def test_model_learns_type_and_ward_and_is_calibrated() -> None:
+    """The model separates fast and slow types, sees the slower ward, and its 90th holds."""
+    train_rows, test_rows = split_by_date(make_requests())
+    models, categories = train(train_rows)
+    metrics = evaluate(models, train_rows, test_rows, categories)
+
+    def usual(request_type: str, ward: int) -> float:
+        frame = pd.DataFrame(
+            {
+                "type": [request_type],
+                "ward": [ward],
+                "channel": ["Web"],
+                "opened": [pd.Timestamp("2025-06-02")],
+            }
+        )
+        return float(models["usual_days"].predict(model_inputs(frame, categories))[0])
+
+    assert usual("Pothole", 1) > 10 * usual("Noise", 1)
+    assert usual("Pothole", 2) > 1.5 * usual("Pothole", 1)
+    assert 0.85 <= metrics["nine_in_ten_days"]["share_closed_within"] <= 0.95
+    # Ward matters here, so the model must beat a lookup that ignores it.
+    assert metrics["usual_days"]["pinball_loss"] < metrics["usual_days"]["pinball_loss_type_lookup"]
 
 
-def test_observed_mode_requires_joined_outcomes() -> None:
-    """Observed mode cannot silently create an all-negative target."""
-    with pytest.raises(DataValidationError, match="pre-joined"):
-        create_target_variable(make_temporal_dataset(), mode="observed")
+def test_type_lookup_falls_back_for_new_types() -> None:
+    train_rows = pd.DataFrame({"type": ["A", "A", "B"], "days_to_close": [1.0, 3.0, 10.0]})
+    test_rows = pd.DataFrame({"type": ["A", "C"]})
 
+    lookup = type_lookup(train_rows, test_rows, 0.5)
 
-def test_get_feature_columns_excludes_identifiers_and_time() -> None:
-    """Identifiers, timestamp, and target do not become model inputs."""
-    dataframe = create_target_variable(make_temporal_dataset())
-    columns = get_feature_columns(dataframe)
-    assert "h3_index" not in columns
-    assert "timestamp" not in columns
-    assert TARGET_COLUMN not in columns
-    assert "line_length_km_water" in columns
-
-
-def test_temporal_split_has_prediction_horizon_gaps() -> None:
-    """Validation and test start at least 48 hours after preceding partitions."""
-    dataframe = create_target_variable(make_temporal_dataset())
-    feature_columns = get_feature_columns(dataframe)
-    split = temporal_train_test_split(dataframe, feature_columns, purge_hours=48)
-    x_train, x_validation, x_test, *_ = split
-
-    train_times = dataframe.loc[x_train.index, "timestamp"]
-    validation_times = dataframe.loc[x_validation.index, "timestamp"]
-    test_times = dataframe.loc[x_test.index, "timestamp"]
-    assert validation_times.min() - train_times.max() >= pd.Timedelta(hours=48)
-    assert test_times.min() - validation_times.max() >= pd.Timedelta(hours=48)
-
-
-def test_training_threshold_and_test_evaluation() -> None:
-    """Threshold selection uses validation before final test evaluation."""
-    dataframe = create_target_variable(make_temporal_dataset(days=40, cells=6))
-    feature_columns = get_feature_columns(dataframe)
-    x_train, x_validation, x_test, y_train, y_validation, y_test = (
-        temporal_train_test_split(dataframe, feature_columns)
-    )
-    model = train_lightgbm(x_train, y_train, x_validation, y_validation)
-    threshold = select_decision_threshold(model, x_validation, y_validation)
-    metrics = evaluate_model(model, x_test, y_test, threshold)
-
-    assert 0 <= threshold <= 1
-    assert metrics["decision_threshold"] == threshold
-    assert 0 <= metrics["pr_auc"] <= 1
-
-
-def test_temporal_split_rejects_missing_timestamp() -> None:
-    """Sorting by H3 is not accepted as a temporal split."""
-    dataframe = create_target_variable(make_temporal_dataset().drop(columns="timestamp"))
-    with pytest.raises(DataValidationError, match="timestamp"):
-        temporal_train_test_split(dataframe, get_feature_columns(dataframe))
+    assert lookup.tolist() == [2.0, 3.0]

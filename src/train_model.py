@@ -1,8 +1,13 @@
-"""Assemble temporal examples and train the synthetic LightGBM demonstration.
+"""Train the "how long will my request take?" model on the committed 311 snapshot.
 
-Training uses chronological train/validation/test partitions with 48-hour purge
-gaps. The validation partition selects a threshold; the test partition is used
-once for final metrics. Saved artifacts are trusted local joblib output bundles.
+Two LightGBM quantile models predict the days until the City marks a request
+closed: the median ("usually") and the 90th percentile ("9 in 10 within").
+Requests opened in the last ``MATURITY_DAYS`` are left out, because many of them
+have not had time to close and would bias the times downward. The latest
+``TEST_DAYS`` of the remaining requests are held out, and both models are
+compared with simply looking up each request type's historical quantile.
+
+    python -m src.train_model
 """
 
 from __future__ import annotations
@@ -11,357 +16,180 @@ import hashlib
 import json
 import logging
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import joblib
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
-from sklearn.metrics import average_precision_score, f1_score, precision_recall_curve
+from sklearn.metrics import mean_pinball_loss
 
-if TYPE_CHECKING:
-    from .config import (
-        DATA_DIR,
-        MODEL_PATH,
-        MODELS_DIR,
-        PREDICTION_HORIZON_HOURS,
-        TARGET_MODE,
-        ensure_directories,
-    )
-    from .errors import ArtifactError, DataValidationError
-else:
-    try:
-        from .config import (
-            DATA_DIR,
-            MODEL_PATH,
-            MODELS_DIR,
-            PREDICTION_HORIZON_HOURS,
-            TARGET_MODE,
-            ensure_directories,
-        )
-        from .errors import ArtifactError, DataValidationError
-    except ImportError:  # pragma: no cover - supports direct script imports
-        from config import (
-            DATA_DIR,
-            MODEL_PATH,
-            MODELS_DIR,
-            PREDICTION_HORIZON_HOURS,
-            TARGET_MODE,
-            ensure_directories,
-        )
-        from errors import ArtifactError, DataValidationError
+from .config import MODEL_PATH, MODELS_DIR, REQUESTS_PATH
+from .errors import ArtifactError, DataValidationError
+from .insights import batch_closed_types
 
 logger = logging.getLogger(__name__)
 
-TARGET_COLUMN = "break_in_next_48h"
-ARTIFACT_SCHEMA_VERSION = 1
+ARTIFACT_SCHEMA_VERSION = 3
 RANDOM_SEED = 42
-MAX_TRAINING_DAYS = 92
-TRAIN_FRACTION = 0.60
-VALIDATION_FRACTION = 0.20
+QUANTILES = {"usual_days": 0.5, "nine_in_ten_days": 0.9}
+CATEGORICAL_FEATURES = ["type", "ward", "channel"]
+FEATURE_COLUMNS = [*CATEGORICAL_FEATURES, "weekday"]
+MATURITY_DAYS = 120
+TEST_DAYS = 120
 
 
-def _read_required_parquet(path: Path, description: str) -> pd.DataFrame:
-    """Load one required local artifact with a clear safe error."""
-    if not path.is_file():
-        raise ArtifactError(f"Missing {description} artifact: {path.name}")
+def load_requests(path: Any = REQUESTS_PATH) -> pd.DataFrame:
+    """Load the 311 snapshot with parsed dates and days to close."""
     try:
-        dataframe = pd.read_parquet(path)
+        requests = pd.read_csv(path, parse_dates=["opened", "closed"], dtype={"ward": "Int64"})
     except (OSError, ValueError) as exc:
-        raise ArtifactError(f"Could not read {description} artifact: {path.name}") from exc
-    if dataframe.empty:
-        raise DataValidationError(f"{description} artifact is empty")
-    return dataframe
+        raise ArtifactError(f"Could not read the 311 snapshot: {path}") from exc
+    if requests.empty:
+        raise DataValidationError("The 311 snapshot is empty")
+    requests["days_to_close"] = (requests["closed"] - requests["opened"]).dt.days
+    return requests
 
 
-def _daily_weather_snapshots(weather: pd.DataFrame) -> pd.DataFrame:
-    """Select the final observation per day to limit cross-join size."""
-    if "timestamp" not in weather:
-        raise DataValidationError("Weather features must contain timestamp")
-    normalized = weather.copy()
-    normalized["timestamp"] = pd.to_datetime(normalized["timestamp"], errors="coerce")
-    if normalized["timestamp"].isna().any():
-        raise DataValidationError("Weather features contain invalid timestamps")
-    normalized = normalized.sort_values("timestamp")
-    daily = normalized.set_index("timestamp").resample("24h").last().dropna(how="all")
-    return daily.tail(MAX_TRAINING_DAYS).reset_index()
+def model_inputs(frame: pd.DataFrame, categories: dict[str, list[str]]) -> pd.DataFrame:
+    """Encode features with the training categories, so unseen values become missing."""
+    inputs = pd.DataFrame(index=frame.index)
+    for column in CATEGORICAL_FEATURES:
+        inputs[column] = pd.Categorical(frame[column].astype(str), categories=categories[column])
+    inputs["weekday"] = frame["opened"].dt.weekday
+    return inputs
 
 
-def assemble_feature_matrix(
-    infrastructure: pd.DataFrame,
-    weather: pd.DataFrame,
-) -> pd.DataFrame:
-    """Cross each H3 aggregate with chronological daily weather snapshots."""
-    required_infrastructure = {"h3_index", "centroid_lat", "centroid_lon"}
-    missing = required_infrastructure - set(infrastructure.columns)
-    if missing:
-        names = ", ".join(sorted(missing))
-        raise DataValidationError(f"Infrastructure features are missing: {names}")
-    if infrastructure["h3_index"].duplicated().any():
-        raise DataValidationError("Infrastructure features contain duplicate H3 indexes")
+def split_by_date(requests: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return non-cancelled train and test requests, test being the latest mature days.
 
-    daily_weather = _daily_weather_snapshots(weather)
-    if len(daily_weather) < 10:
-        raise DataValidationError("At least 10 daily weather snapshots are required")
-    matrix = infrastructure.merge(daily_weather, how="cross", suffixes=("", "_weather"))
-    return matrix.sort_values(["timestamp", "h3_index"]).reset_index(drop=True)
+    Training keeps closed requests only. Test also keeps the few still open after
+    ``MATURITY_DAYS``, because dropping them would hide exactly the slow cases.
+    """
+    snapshot_end = requests["opened"].max()
+    mature_end = snapshot_end - pd.Timedelta(days=MATURITY_DAYS)
+    test_start = mature_end - pd.Timedelta(days=TEST_DAYS)
+    usable = requests[(requests["status"] != "Cancelled") & (requests["opened"] <= mature_end)]
+    train = usable[usable["opened"] < test_start].dropna(subset=["days_to_close"])
+    test = usable[usable["opened"] >= test_start]
+    if train.empty or test.empty:
+        raise DataValidationError("Not enough history to train and test")
+    return train, test
 
 
-def load_feature_matrix() -> pd.DataFrame:
-    """Load required pipeline artifacts and assemble temporal model examples."""
-    infrastructure = _read_required_parquet(
-        DATA_DIR / "infrastructure_features.parquet",
-        "infrastructure features",
-    )
-    weather = _read_required_parquet(DATA_DIR / "weather_features.parquet", "weather features")
-    return assemble_feature_matrix(infrastructure, weather)
-
-
-def create_target_variable(
-    dataframe: pd.DataFrame,
-    mode: str = TARGET_MODE,
-) -> pd.DataFrame:
-    """Create an explicitly synthetic target or validate an observed target."""
-    if dataframe.empty:
-        return dataframe.copy()
-    if mode not in {"synthetic", "observed"}:
-        raise ValueError("mode must be one of: synthetic, observed")
-    result = dataframe.copy()
-    if mode == "observed":
-        if TARGET_COLUMN not in result:
-            raise DataValidationError(
-                "Observed target mode requires a reviewed, pre-joined outcome column"
-            )
-        result[TARGET_COLUMN] = result[TARGET_COLUMN].astype(int)
-        return result
-
-    water_length = result.get("line_length_km_water", pd.Series(0.0, index=result.index))
-    vintage = result.get("pct_pre_1980", pd.Series(0.0, index=result.index))
-    heat = result.get("heat_index_c", pd.Series(20.0, index=result.index))
-    dry_days = result.get("consecutive_dry_days", pd.Series(0.0, index=result.index))
-    recent_rain = result.get("rainfall_48h", pd.Series(0.0, index=result.index))
-
-    synthetic_score = (
-        (water_length > water_length.median()).astype(int) * 2
-        + (vintage >= 0.4).astype(int) * 2
-        + (heat >= 28.0).astype(int)
-        + (dry_days >= 2.0).astype(int)
-        + (recent_rain < 1.0).astype(int)
-    )
-    result[TARGET_COLUMN] = (synthetic_score >= 4).astype(int)
-    logger.info("Synthetic target distribution: %s", result[TARGET_COLUMN].value_counts().to_dict())
-    return result
-
-
-def get_feature_columns(dataframe: pd.DataFrame) -> list[str]:
-    """Return sorted numeric model inputs while excluding IDs, target, and time."""
-    excluded = {
-        "h3_index",
-        TARGET_COLUMN,
-        "geometry",
-        "centroid_lat",
-        "centroid_lon",
-        "timestamp",
-    }
-    return sorted(
-        column
-        for column in dataframe.select_dtypes(include="number").columns
-        if column not in excluded
-    )
-
-
-def temporal_train_test_split(
-    dataframe: pd.DataFrame,
-    feature_columns: list[str],
-    target_col: str = TARGET_COLUMN,
-    purge_hours: int = PREDICTION_HORIZON_HOURS,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, pd.Series]:
-    """Split by timestamp and remove prediction-horizon gaps between partitions."""
-    if "timestamp" not in dataframe:
-        raise DataValidationError("Temporal split requires a timestamp column")
-    if target_col not in dataframe:
-        raise DataValidationError(f"Temporal split requires target column {target_col}")
-    if purge_hours < 0:
-        raise ValueError("purge_hours cannot be negative")
-
-    ordered = dataframe.copy()
-    ordered["timestamp"] = pd.to_datetime(ordered["timestamp"], errors="coerce")
-    if ordered["timestamp"].isna().any():
-        raise DataValidationError("Temporal split received an invalid timestamp")
-    ordered = ordered.sort_values(["timestamp", "h3_index"]).reset_index(drop=True)
-    unique_times = ordered["timestamp"].drop_duplicates().sort_values().tolist()
-    if len(unique_times) < 10:
-        raise DataValidationError("Temporal split requires at least 10 unique timestamps")
-
-    train_count = max(1, int(len(unique_times) * TRAIN_FRACTION))
-    validation_end_count = max(
-        train_count + 1,
-        int(len(unique_times) * (TRAIN_FRACTION + VALIDATION_FRACTION)),
-    )
-    train_end = pd.Timestamp(unique_times[train_count - 1])
-    validation_end = pd.Timestamp(unique_times[validation_end_count - 1])
-    purge_gap = pd.Timedelta(hours=purge_hours)
-
-    train_rows = ordered[ordered["timestamp"] <= train_end]
-    validation_rows = ordered[
-        (ordered["timestamp"] >= train_end + purge_gap)
-        & (ordered["timestamp"] <= validation_end)
-    ]
-    test_rows = ordered[ordered["timestamp"] >= validation_end + purge_gap]
-    if train_rows.empty or validation_rows.empty or test_rows.empty:
-        raise DataValidationError("Temporal split is empty after applying purge gaps")
-
-    return (
-        train_rows[feature_columns],
-        validation_rows[feature_columns],
-        test_rows[feature_columns],
-        train_rows[target_col],
-        validation_rows[target_col],
-        test_rows[target_col],
-    )
-
-
-def train_lightgbm(
-    x_train: pd.DataFrame,
-    y_train: pd.Series,
-    x_validation: pd.DataFrame,
-    y_validation: pd.Series,
-) -> lgb.LGBMClassifier:
-    """Train a small deterministic classifier with imbalance compensation."""
-    if y_train.nunique() < 2:
-        raise DataValidationError("Training target must contain both classes")
-    positive_count = int(y_train.sum())
-    negative_count = len(y_train) - positive_count
-    model = lgb.LGBMClassifier(
-        objective="binary",
-        n_estimators=100,
-        learning_rate=0.05,
+def _new_model(alpha: float) -> lgb.LGBMRegressor:
+    return lgb.LGBMRegressor(
+        objective="quantile",
+        alpha=alpha,
+        n_estimators=300,
+        learning_rate=0.1,
         num_leaves=15,
-        max_depth=5,
-        min_child_samples=5,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        scale_pos_weight=float(negative_count / positive_count),
+        min_child_samples=50,
         random_state=RANDOM_SEED,
+        # shortcut: LightGBM 4.6.0's col-wise histograms crashed natively on this project's
+        # data (Windows, Python 3.13), so the timing-based auto choice failed ~1 in 3 runs.
+        # Revisit after a LightGBM upgrade.
+        force_row_wise=True,
         n_jobs=1,
         verbosity=-1,
     )
-    model.fit(
-        x_train,
-        y_train,
-        eval_set=[(x_validation, y_validation)],
-        eval_metric="binary_logloss",
-    )
-    return model
 
 
-def select_decision_threshold(
-    model: lgb.LGBMClassifier,
-    x_validation: pd.DataFrame,
-    y_validation: pd.Series,
-) -> float:
-    """Choose an F1-maximizing threshold using validation data only."""
-    if y_validation.nunique() < 2:
-        return 0.5
-    probabilities = model.predict_proba(x_validation)[:, 1]
-    precision, recall, thresholds = precision_recall_curve(y_validation, probabilities)
-    if len(thresholds) == 0:
-        return 0.5
-    f1_values = 2 * precision[:-1] * recall[:-1] / (precision[:-1] + recall[:-1] + 1e-12)
-    return float(thresholds[int(np.argmax(f1_values))])
+def type_lookup(train: pd.DataFrame, test: pd.DataFrame, alpha: float) -> pd.Series:
+    """Baseline: each request type's historical quantile, or the overall one for new types."""
+    by_type = train.groupby("type")["days_to_close"].quantile(alpha)
+    fallback = float(train["days_to_close"].quantile(alpha))
+    return test["type"].map(by_type).fillna(fallback)
 
 
-def evaluate_model(
-    model: lgb.LGBMClassifier,
-    x_test: pd.DataFrame,
-    y_test: pd.Series,
-    decision_threshold: float = 0.5,
-    target_mode: str = TARGET_MODE,
+def evaluate(
+    models: dict[str, lgb.LGBMRegressor],
+    train: pd.DataFrame,
+    test: pd.DataFrame,
+    categories: dict[str, list[str]],
 ) -> dict[str, Any]:
-    """Evaluate the untouched test partition at a preselected threshold."""
-    probabilities = model.predict_proba(x_test)[:, 1]
-    predictions = (probabilities >= decision_threshold).astype(int)
-    pr_auc = (
-        float(average_precision_score(y_test, probabilities))
-        if y_test.nunique() > 1
-        else 0.0
-    )
-    return {
-        "pr_auc": pr_auc,
-        "f1_at_threshold": float(f1_score(y_test, predictions, zero_division=0)),
-        "decision_threshold": decision_threshold,
-        "target_mode": target_mode,
-        "prediction_horizon_hours": PREDICTION_HORIZON_HOURS,
-        "test_rows": len(y_test),
+    """Score both quantile models and the per-type lookup on the held-out requests."""
+    closed = test["days_to_close"].notna()
+    actual = test.loc[closed, "days_to_close"]
+    inputs = model_inputs(test, categories)
+    metrics: dict[str, Any] = {
+        "test_requests": len(test),
+        "test_requests_still_open": int((~closed).sum()),
+        "test_start": str(test["opened"].min().date()),
+        "test_end": str(test["opened"].max().date()),
     }
+    for name, alpha in QUANTILES.items():
+        predicted = pd.Series(np.clip(models[name].predict(inputs), 0, None), index=test.index)
+        baseline = type_lookup(train, test, alpha)
+        # A still-open request counts as not closed within the estimate (NaN <= x is False).
+        within = test["days_to_close"] <= predicted
+        metrics[name] = {
+            "pinball_loss": float(mean_pinball_loss(actual, predicted[closed], alpha=alpha)),
+            "pinball_loss_type_lookup": float(
+                mean_pinball_loss(actual, baseline[closed], alpha=alpha)
+            ),
+            "share_closed_within": float(within.mean()),
+            "share_closed_within_type_lookup": float((test["days_to_close"] <= baseline).mean()),
+            "median_absolute_error_days": float(np.median(np.abs(actual - predicted[closed]))),
+        }
+    return metrics
 
 
-def _artifact_version(feature_columns: list[str], row_count: int) -> str:
-    """Create a stable short version from schema-relevant training inputs."""
-    payload = json.dumps(
-        {"features": feature_columns, "rows": row_count, "target_mode": TARGET_MODE},
-        sort_keys=True,
-    ).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()[:12]
-
-
-def save_artifacts(
-    model: lgb.LGBMClassifier,
-    feature_columns: list[str],
-    decision_threshold: float,
-    metrics: dict[str, Any],
-    row_count: int,
-) -> dict[str, Any]:
-    """Atomically save a trusted model bundle and human-readable metadata."""
-    ensure_directories()
-    model_version = _artifact_version(feature_columns, row_count)
-    metadata = {
-        "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
-        "model_version": model_version,
-        "target_mode": TARGET_MODE,
-        "prediction_horizon_hours": PREDICTION_HORIZON_HOURS,
-        "training_rows": row_count,
-        "trained_at_utc": datetime.now(timezone.utc).isoformat(),
-        "warning": "Synthetic demonstration target; not an operational forecast.",
+def train(train_rows: pd.DataFrame) -> tuple[dict[str, lgb.LGBMRegressor], dict[str, list[str]]]:
+    """Fit one quantile model per entry in ``QUANTILES``."""
+    categories = {
+        column: sorted(train_rows[column].astype(str).unique()) for column in CATEGORICAL_FEATURES
     }
-    bundle = {
-        "model": model,
-        "feature_columns": feature_columns,
-        "decision_threshold": decision_threshold,
-        "metadata": metadata,
+    inputs = model_inputs(train_rows, categories)
+    models = {
+        name: _new_model(alpha).fit(inputs, train_rows["days_to_close"])
+        for name, alpha in QUANTILES.items()
     }
+    return models, categories
+
+
+def save_artifacts(bundle: dict[str, Any], metrics: dict[str, Any]) -> None:
+    """Atomically save the trusted model bundle and readable metrics."""
+    MODELS_DIR.mkdir(exist_ok=True)
     temporary_model = MODEL_PATH.with_suffix(f"{MODEL_PATH.suffix}.tmp")
     joblib.dump(bundle, temporary_model)
     temporary_model.replace(MODEL_PATH)
 
-    metrics_payload = {**metrics, **metadata}
     metrics_path = MODELS_DIR / "model_metrics.json"
     temporary_metrics = metrics_path.with_suffix(".json.tmp")
-    temporary_metrics.write_text(json.dumps(metrics_payload, indent=2), encoding="utf-8")
+    temporary_metrics.write_text(
+        json.dumps({**metrics, **bundle["metadata"]}, indent=2), encoding="utf-8"
+    )
     temporary_metrics.replace(metrics_path)
-
-    importance = pd.DataFrame(
-        {"feature": feature_columns, "importance": model.feature_importances_}
-    ).sort_values(["importance", "feature"], ascending=[False, True])
-    importance.to_csv(MODELS_DIR / "feature_importance.csv", index=False)
-    return metadata
 
 
 def main() -> None:
-    """Train, evaluate, and save the local demonstration model."""
-    matrix = create_target_variable(load_feature_matrix())
-    feature_columns = get_feature_columns(matrix)
-    if not feature_columns:
-        raise DataValidationError("No numeric model features are available")
-    x_train, x_validation, x_test, y_train, y_validation, y_test = (
-        temporal_train_test_split(matrix, feature_columns)
-    )
-    model = train_lightgbm(x_train, y_train, x_validation, y_validation)
-    threshold = select_decision_threshold(model, x_validation, y_validation)
-    metrics = evaluate_model(model, x_test, y_test, threshold)
-    metadata = save_artifacts(model, feature_columns, threshold, metrics, len(matrix))
-    logger.info("Saved trusted synthetic model artifact version %s", metadata["model_version"])
+    """Evaluate on held-out requests, then refit on everything mature and save."""
+    requests = load_requests()
+    # shortcut: types the City closed in bulk are left out, because their closing dates
+    # before the May 2026 mass closure are not real and too few have closed since to hold
+    # out a test set. The API answers for them from recent history instead. Train on their
+    # post-closure requests once there is a year of them.
+    requests = requests[~requests["type"].isin(batch_closed_types(requests))]
+    train_rows, test_rows = split_by_date(requests)
+    models, categories = train(train_rows)
+    metrics = evaluate(models, train_rows, test_rows, categories)
+
+    final_models, final_categories = train(pd.concat([train_rows, test_rows]))
+    version = hashlib.sha256(str(requests["opened"].max()).encode()).hexdigest()[:12]
+    bundle = {
+        "models": final_models,
+        "categories": final_categories,
+        "metadata": {
+            "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
+            "model_version": version,
+            "training_requests": len(train_rows) + len(test_rows),
+            "trained_at_utc": datetime.now(timezone.utc).isoformat(),
+            "warning": "Days until the City marks a request closed, not when work was done.",
+        },
+    }
+    save_artifacts(bundle, metrics)
+    logger.info("Saved model %s: %s", version, json.dumps(metrics))
 
 
 if __name__ == "__main__":
