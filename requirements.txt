@@ -1,15 +1,6 @@
 # Runtime dependencies tested together on Python 3.11.
 numpy==2.3.2
 pandas==2.3.2
-pyarrow==23.0.1
-geopandas==1.1.3
-shapely==2.1.2
-pyproj==3.7.2
-h3==4.5.0
-
-SQLAlchemy==2.0.51
-psycopg2-binary==2.9.12
-GeoAlchemy2==0.20.0
 
 requests==2.33.0
 

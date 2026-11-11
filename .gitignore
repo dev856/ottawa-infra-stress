@@ -257,3 +257,7 @@ REFACTOR_PLAN.md
 SECURITY_REVIEW.md
 TASKS.md
 USER_GUIDE.md
+
+# Frontend build tooling
+frontend/node_modules/
+!frontend/dist/
