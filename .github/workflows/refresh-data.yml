@@ -1,0 +1,42 @@
+name: Refresh open data
+
+on:
+  schedule:
+    # Weekly, not daily: every refresh adds a ~4 MB snapshot to the git history.
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: refresh-data
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install pinned dependencies
+        run: python -m pip install -r requirements.txt
+
+      # Training runs too, so a snapshot the model cannot be built from is never committed.
+      - name: Download fresh City data and train
+        run: python run_pipeline.py --refresh
+
+      - name: Commit the snapshot if it changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add open_data
+          git diff --cached --quiet || (git commit -m "data: refresh 311 snapshot" && git push)
