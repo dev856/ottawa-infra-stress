@@ -1,8 +1,8 @@
-"""Serve bounded, aggregate-only risk responses through FastAPI.
+"""Serve Ottawa 311 insights and the dashboard through FastAPI.
 
-The API validates H3 and bounding-box inputs, restricts CORS to configured local
-origins, emits basic security headers, and maps internal failures to generic
-client messages while retaining sanitized server logs.
+The API restricts CORS to configured local origins, emits basic security
+headers, and maps internal failures to generic client messages while keeping
+sanitized server logs.
 """
 
 from __future__ import annotations
@@ -10,56 +10,32 @@ from __future__ import annotations
 import json
 import logging
 from functools import lru_cache
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any
 
-import h3
-import numpy as np
 import pandas as pd
 from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field
 
-from api.services import (
-    ModelBundle,
-    RiskPredictor,
-    RiskRepository,
-    load_latest_weather_features,
-    load_model_bundle,
-)
-from src.config import (
-    API_CORS_ORIGINS,
-    API_HOST,
-    API_PORT,
-    DATA_SOURCE_MODE,
-    FRONTEND_DIR,
-    H3_RESOLUTION,
-    MAX_API_FEATURES,
-    MAX_BBOX_SPAN_DEGREES,
-    MODELS_DIR,
-    OTTAWA_BBOX_EAST,
-    OTTAWA_BBOX_NORTH,
-    OTTAWA_BBOX_SOUTH,
-    OTTAWA_BBOX_WEST,
-    PREDICTION_HORIZON_HOURS,
-)
-from src.errors import ArtifactError, DataValidationError, ExternalServiceError
+from api.services import ModelBundle, Snapshot, load_model_bundle, load_snapshot
+from src.config import API_CORS_ORIGINS, API_HOST, API_PORT, FRONTEND_DIR, MODELS_DIR
+from src.errors import ArtifactError, DataValidationError
+from src.insights import remaining_wait, ward_metrics, ward_report
+from src.train_model import MATURITY_DAYS
 
 logger = logging.getLogger(__name__)
 
-HIGH_RISK_THRESHOLD = 0.70
-MEDIUM_RISK_THRESHOLD = 0.30
-DEFAULT_MAP_FEATURES = min(500, MAX_API_FEATURES)
+ATTRIBUTION = "Contains information licensed under the Open Government Licence – City of Ottawa."
 
 app = FastAPI(
-    title="Ottawa Infrastructure Stress Predictor",
+    title="Ottawa 311 Insights",
     description=(
-        "Local synthetic demonstration of aggregate 48-hour water-main-break risk. "
-        "Not an operational municipal forecast."
+        "Ward report cards, request closing times, and unusual spikes from City of Ottawa "
+        "311 open data. Not affiliated with or endorsed by the City of Ottawa."
     ),
-    version="2.0.0",
+    version="4.0.0",
 )
 app.add_middleware(
     TrustedHostMiddleware,
@@ -75,67 +51,16 @@ app.add_middleware(
 )
 
 
-class HealthResponse(BaseModel):
-    """Process liveness response."""
-
-    status: Literal["ok"]
-    service: Literal["ottawa-infra-stress"]
-
-
-class WeatherSummaryResponse(BaseModel):
-    """Latest aggregate weather indicators used by inference."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    temperature_c: float
-    relative_humidity: float
-    heat_index_c: float
-    consecutive_dry_days: float
-    rainfall_48h: float
-    station_name: str
-    observed_at: str
-    data_source_mode: str
-    is_synthetic: bool
-    forecast_horizon_hours: int
-
-
-class HexagonRiskResponse(BaseModel):
-    """One aggregate H3 risk response."""
-
-    h3_index: str
-    risk_score: float = Field(ge=0, le=1)
-    risk_level: Literal["low", "medium", "high"]
-    target_mode: str
-    model_version: str
-    features: dict[str, float | int]
-
-
-def get_risk_level(score: float) -> Literal["low", "medium", "high"]:
-    """Convert a finite probability into documented display bands."""
-    if not np.isfinite(score) or not 0 <= score <= 1:
-        raise ValueError("score must be a finite probability")
-    if score >= HIGH_RISK_THRESHOLD:
-        return "high"
-    if score >= MEDIUM_RISK_THRESHOLD:
-        return "medium"
-    return "low"
-
-
 @lru_cache(maxsize=1)
-def get_repository() -> RiskRepository:
-    """Return the process-wide aggregate storage reader."""
-    return RiskRepository()
-
-
-@lru_cache(maxsize=1)
-def get_predictor() -> RiskPredictor:
+def get_model() -> ModelBundle:
     """Load the trusted configured model once per API process."""
-    return RiskPredictor(load_model_bundle())
+    return load_model_bundle()
 
 
-def get_weather_features() -> dict[str, Any]:
-    """Return latest weather inputs; isolated as an injectable dependency."""
-    return load_latest_weather_features()
+@lru_cache(maxsize=1)
+def get_snapshot() -> Snapshot:
+    """Load the 311 snapshot and its derived insights once per API process."""
+    return load_snapshot()
 
 
 @app.middleware("http")
@@ -154,49 +79,27 @@ async def add_security_headers(request: Request, call_next: Any) -> Any:
 async def handle_artifact_error(request: Request, exc: ArtifactError) -> JSONResponse:
     """Hide model/filesystem details from clients while logging safe context."""
     logger.error("Artifact operation failed for %s: %s", request.url.path, exc)
-    return JSONResponse(status_code=503, content={"detail": "Prediction artifacts are unavailable"})
-
-
-@app.exception_handler(ExternalServiceError)
-async def handle_external_error(request: Request, exc: ExternalServiceError) -> JSONResponse:
-    """Map storage/service failures to a generic availability response."""
-    logger.error("External dependency failed for %s: %s", request.url.path, exc)
-    return JSONResponse(status_code=503, content={"detail": "Prediction service is unavailable"})
+    return JSONResponse(status_code=503, content={"detail": "The data is unavailable"})
 
 
 @app.exception_handler(DataValidationError)
 async def handle_internal_data_error(request: Request, exc: DataValidationError) -> JSONResponse:
-    """Treat malformed trusted artifacts as an internal error without leaking rows."""
+    """Treat malformed trusted snapshot files as an internal error."""
     logger.error("Internal data validation failed for %s: %s", request.url.path, exc)
     return JSONResponse(status_code=500, content={"detail": "Internal data validation failed"})
 
 
-def _validate_bbox(west: float, south: float, east: float, north: float) -> None:
-    """Reject reversed, oversized, or out-of-project bounding boxes."""
-    if west >= east:
-        raise HTTPException(status_code=400, detail="min_lon must be less than max_lon")
-    if south >= north:
-        raise HTTPException(status_code=400, detail="min_lat must be less than max_lat")
-    if east - west > MAX_BBOX_SPAN_DEGREES or north - south > MAX_BBOX_SPAN_DEGREES:
-        raise HTTPException(status_code=400, detail="Bounding box is too large")
-    if not (
-        OTTAWA_BBOX_WEST <= west <= OTTAWA_BBOX_EAST
-        and OTTAWA_BBOX_WEST <= east <= OTTAWA_BBOX_EAST
-        and OTTAWA_BBOX_SOUTH <= south <= OTTAWA_BBOX_NORTH
-        and OTTAWA_BBOX_SOUTH <= north <= OTTAWA_BBOX_NORTH
-    ):
-        raise HTTPException(status_code=400, detail="Bounding box must stay within Ottawa")
+SnapshotDependency = Annotated[Snapshot, Depends(get_snapshot)]
+TypeQuery = Query(..., alias="type", min_length=1, max_length=200)
 
 
-def _model_metadata(bundle: ModelBundle) -> tuple[str, str]:
-    """Return required public provenance fields from a validated bundle."""
-    return (
-        str(bundle.metadata.get("target_mode", "unknown")),
-        str(bundle.metadata.get("model_version", "unknown")),
-    )
+def require_known_type(snapshot: Snapshot, request_type: str) -> None:
+    """Reject request types too rare to say anything reliable about."""
+    if request_type not in {item["type"] for item in snapshot.request_types}:
+        raise HTTPException(status_code=404, detail="Unknown or rare request type")
 
 
-@app.get("/health", response_model=HealthResponse)
+@app.get("/health")
 def health_check() -> dict[str, str]:
     """Report process liveness without accessing storage or models."""
     return {"status": "ok", "service": "ottawa-infra-stress"}
@@ -204,49 +107,23 @@ def health_check() -> dict[str, str]:
 
 @app.get("/ready")
 def readiness_check() -> JSONResponse:
-    """Report non-secret artifact readiness separately from liveness."""
+    """Report whether the model and snapshot files load."""
     try:
-        bundle = load_model_bundle()
-        load_latest_weather_features()
+        bundle = get_model()
+        get_snapshot()
     except (ArtifactError, DataValidationError):
         return JSONResponse(status_code=503, content={"status": "not_ready"})
     return JSONResponse(
         status_code=200,
-        content={
-            "status": "ready",
-            "model_version": bundle.metadata["model_version"],
-            "target_mode": bundle.metadata["target_mode"],
-        },
+        content={"status": "ready", "model_version": bundle.metadata["model_version"]},
     )
-
-
-@app.get("/weather-summary", response_model=WeatherSummaryResponse)
-def weather_summary(
-    weather: Annotated[dict[str, Any], Depends(get_weather_features)],
-) -> dict[str, Any]:
-    """Return the latest aggregate weather row with explicit source labeling."""
-    timestamp = pd.Timestamp(weather["timestamp"])
-    return {
-        "temperature_c": round(float(weather["temperature_c"]), 1),
-        "relative_humidity": round(float(weather["relative_humidity"]), 1),
-        "heat_index_c": round(float(weather["heat_index_c"]), 1),
-        "consecutive_dry_days": round(float(weather["consecutive_dry_days"]), 2),
-        "rainfall_48h": round(float(weather["rainfall_48h"]), 2),
-        "station_name": str(weather.get("station_name", "Unknown station")),
-        "observed_at": timestamp.isoformat(),
-        "data_source_mode": DATA_SOURCE_MODE,
-        "is_synthetic": DATA_SOURCE_MODE == "mock",
-        "forecast_horizon_hours": PREDICTION_HORIZON_HOURS,
-    }
 
 
 @app.get("/metrics")
 def model_metrics() -> dict[str, Any]:
-    """Return reviewed model metadata and up to ten aggregate importances."""
-    metrics_path = MODELS_DIR / "model_metrics.json"
-    importance_path = MODELS_DIR / "feature_importance.csv"
+    """Return the reviewed model evaluation written at training time."""
     metrics: dict[str, Any] = {}
-    features: list[dict[str, Any]] = []
+    metrics_path = MODELS_DIR / "model_metrics.json"
     if metrics_path.is_file():
         try:
             parsed = json.loads(metrics_path.read_text(encoding="utf-8"))
@@ -254,112 +131,118 @@ def model_metrics() -> dict[str, Any]:
                 metrics = parsed
         except (OSError, json.JSONDecodeError):
             logger.error("Model metrics artifact is invalid")
-    if importance_path.is_file():
-        try:
-            features = pd.read_csv(importance_path).head(10).to_dict(orient="records")
-        except (OSError, ValueError):
-            logger.error("Feature-importance artifact is invalid")
+    return {"metrics": metrics, "model_type": "LightGBM quantile regression (50th and 90th)"}
+
+
+@app.get("/wards")
+def wards(snapshot: SnapshotDependency) -> dict[str, Any]:
+    """Return ward boundaries with 12-month request totals and current spike counts."""
     return {
-        "metrics": metrics,
-        "features": features,
-        "model_type": "LightGBM binary classifier",
-        "target_warning": "Synthetic demonstration target; not an operational forecast.",
-        "spatial_resolution": f"H3 resolution {H3_RESOLUTION}",
-        "prediction_horizon_hours": PREDICTION_HORIZON_HOURS,
+        **snapshot.wards,
+        "as_of": snapshot.end.date().isoformat(),
+        "attribution": ATTRIBUTION,
     }
 
 
-@app.get("/risk-map")
-def risk_map(
-    repository: Annotated[RiskRepository, Depends(get_repository)],
-    predictor: Annotated[RiskPredictor, Depends(get_predictor)],
-    weather: Annotated[dict[str, Any], Depends(get_weather_features)],
-    min_lon: float = Query(..., ge=-180, le=180),
-    min_lat: float = Query(..., ge=-90, le=90),
-    max_lon: float = Query(..., ge=-180, le=180),
-    max_lat: float = Query(..., ge=-90, le=90),
-    max_features: int = Query(DEFAULT_MAP_FEATURES, ge=1, le=10_000),
-    sim_temp_c: float | None = Query(None, ge=-50, le=60),
-    sim_humidity: float | None = Query(None, ge=0, le=100),
-    sim_dry_days: float | None = Query(None, ge=0, le=365),
+@app.get("/wards/{ward}")
+def ward_report_card(
+    snapshot: SnapshotDependency,
+    ward: int = Path(..., ge=1, le=24),
 ) -> dict[str, Any]:
-    """Return bounded H3 aggregate predictions as a GeoJSON FeatureCollection."""
-    _validate_bbox(min_lon, min_lat, max_lon, max_lat)
-    if max_features > MAX_API_FEATURES:
-        raise HTTPException(status_code=400, detail="max_features exceeds the server limit")
-    result = repository.get_bbox((min_lon, min_lat, max_lon, max_lat), max_features)
-    scenario = {
-        "temperature_c": sim_temp_c,
-        "relative_humidity": sim_humidity,
-        "dry_days": sim_dry_days,
+    """Return one ward's most common requests and closing times compared with the city."""
+    report = ward_report(snapshot.requests, ward, snapshot.end, snapshot.batch_types)
+    spikes = [spike for spike in snapshot.spikes if spike["ward"] == ward]
+    return {**report, "name": snapshot.ward_name(ward), "spikes": spikes}
+
+
+@app.get("/city")
+def city_report_card(snapshot: SnapshotDependency) -> dict[str, Any]:
+    """Return the city-wide report card and every unusual spike this week."""
+    report = ward_report(snapshot.requests, None, snapshot.end, snapshot.batch_types)
+    return {**report, "name": "All of Ottawa", "spikes": snapshot.spikes}
+
+
+@app.get("/request-types")
+def request_types(snapshot: SnapshotDependency) -> list[dict[str, Any]]:
+    """Return request types common enough to estimate, most frequent first."""
+    return snapshot.request_types
+
+
+@app.get("/estimate")
+def estimate(
+    snapshot: SnapshotDependency,
+    model: Annotated[ModelBundle, Depends(get_model)],
+    request_type: str = TypeQuery,
+    ward: int = Query(..., ge=1, le=24),
+) -> dict[str, Any]:
+    """Estimate how long a new request of this type in this ward takes to be closed."""
+    require_known_type(snapshot, request_type)
+    batch_closed = request_type in snapshot.batch_types
+    usual: float | None
+    upper: float | None
+    if batch_closed:
+        # The model is not trained on these types; only their requests since the City's
+        # mass closure have real closing dates, so the answer is read from those.
+        mature_before = snapshot.end - pd.Timedelta(days=MATURITY_DAYS)
+        history = remaining_wait(snapshot.timed, request_type, ward, 0, mature_before)
+        usual, upper = history["usual_more_days"], history["nine_in_ten_more_days"]
+    else:
+        days = model.estimate(request_type, ward, pd.Timestamp.now())
+        usual, upper = round(days["usual_days"], 1), round(days["nine_in_ten_days"], 1)
+    return {
+        "type": request_type,
+        "ward": ward,
+        "usual_days": usual,
+        "nine_in_ten_days": upper,
+        "batch_closed": batch_closed,
+        "note": model.metadata["warning"],
     }
-    scores = predictor.predict_many(
-        [row["features"] for row in result.rows],
-        weather,
-        scenario,
-    )
-    target_mode, model_version = _model_metadata(predictor.bundle)
-    features = []
-    for row, score in zip(result.rows, scores, strict=True):
-        aggregate = row["features"]
-        features.append(
+
+
+@app.get("/remaining")
+def remaining(
+    snapshot: SnapshotDependency,
+    request_type: str = TypeQuery,
+    ward: int = Query(..., ge=1, le=24),
+    waited: int = Query(..., ge=1, le=365),
+) -> dict[str, Any]:
+    """Say how much longer requests like this took once they had waited ``waited`` days."""
+    require_known_type(snapshot, request_type)
+    mature_before = snapshot.end - pd.Timedelta(days=MATURITY_DAYS)
+    result = remaining_wait(snapshot.timed, request_type, ward, waited, mature_before)
+    return {"type": request_type, "ward": ward, "waited_days": waited, **result}
+
+
+@app.get("/ward-metrics")
+def ward_metrics_for_map(
+    snapshot: SnapshotDependency,
+    request_type: str | None = Query(None, alias="type", min_length=1, max_length=200),
+) -> dict[str, Any]:
+    """Return what the map can be coloured by per ward, for one request type or all."""
+    if request_type is not None:
+        require_known_type(snapshot, request_type)
+    metrics = ward_metrics(snapshot.requests, snapshot.end, request_type)
+    wards = []
+    for feature in snapshot.wards["features"]:
+        ward = feature["properties"]["ward"]
+        spikes = sum(
+            spike["ward"] == ward and request_type in (None, spike["type"])
+            for spike in snapshot.spikes
+        )
+        wards.append(
             {
-                "type": "Feature",
-                "geometry": row["geometry"],
-                "properties": {
-                    "h3_index": row["h3_index"],
-                    "risk_score": round(score, 4),
-                    "risk_level": get_risk_level(score),
-                    "water_km": round(float(aggregate.get("line_length_km_water", 0)), 2),
-                    "vintage_pre1980_pct": round(
-                        float(aggregate.get("pct_pre_1980", 0)) * 100,
-                        1,
-                    ),
-                    "target_mode": target_mode,
-                    "model_version": model_version,
-                },
+                "ward": ward,
+                **metrics.get(ward, {"requests": 0, "median_days": None}),
+                "spikes": spikes,
             }
         )
-    return {
-        "type": "FeatureCollection",
-        "features": features,
-        "metadata": {
-            "feature_count": len(features),
-            "truncated": result.truncated,
-            "target_mode": target_mode,
-            "model_version": model_version,
-            "scenario_applied": any(value is not None for value in scenario.values()),
-        },
-    }
+    return {"type": request_type, "wards": wards}
 
 
-@app.get("/risk/{h3_index}", response_model=HexagonRiskResponse)
-def risk_for_hexagon(
-    repository: Annotated[RiskRepository, Depends(get_repository)],
-    predictor: Annotated[RiskPredictor, Depends(get_predictor)],
-    weather: Annotated[dict[str, Any], Depends(get_weather_features)],
-    h3_index: str = Path(..., min_length=15, max_length=20, pattern=r"^[0-9a-f]+$"),
-) -> dict[str, Any]:
-    """Return one validated H3 cell's aggregate features and prediction."""
-    if not h3.is_valid_cell(h3_index) or h3.get_resolution(h3_index) != H3_RESOLUTION:
-        raise HTTPException(status_code=422, detail="h3_index is invalid for this API")
-    aggregate = repository.get_h3(h3_index)
-    if aggregate is None:
-        raise HTTPException(status_code=404, detail="H3 cell not found")
-    score = predictor.predict_many(
-        [aggregate],
-        weather,
-        {"temperature_c": None, "relative_humidity": None, "dry_days": None},
-    )[0]
-    target_mode, model_version = _model_metadata(predictor.bundle)
-    return {
-        "h3_index": h3_index,
-        "risk_score": round(score, 4),
-        "risk_level": get_risk_level(score),
-        "target_mode": target_mode,
-        "model_version": model_version,
-        "features": aggregate,
-    }
+@app.get("/spikes")
+def spikes(snapshot: SnapshotDependency) -> dict[str, Any]:
+    """Return ward/request-type pairs with far more requests this week than usual."""
+    return {"week_ending": snapshot.end.date().isoformat(), "spikes": snapshot.spikes}
 
 
 if FRONTEND_DIR.is_dir() and (FRONTEND_DIR / "index.html").is_file():

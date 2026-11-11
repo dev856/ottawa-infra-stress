@@ -1,112 +1,100 @@
-"""API contract and security tests using aggregate-only in-memory services."""
+"""API contract and security tests using an in-memory snapshot and model."""
 
+import json
+from pathlib import Path
 from typing import Any
 
-import h3
+import joblib
 import numpy as np
+import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 
-from api.main import (
-    app,
-    get_predictor,
-    get_repository,
-    get_risk_level,
-    get_weather_features,
-)
-from api.services import ModelBundle, RiskMapRows, RiskPredictor
+from api.main import app, get_model, get_snapshot
+from api.services import ModelBundle, Snapshot, load_model_bundle, load_snapshot
 from src.errors import ArtifactError
 
-VALID_CELL = h3.latlng_to_cell(45.4215, -75.6972, 8)
-MISSING_CELL = next(cell for cell in h3.grid_ring(VALID_CELL, 1) if cell != VALID_CELL)
+END = pd.Timestamp("2026-10-31")
 
 
-class FakeClassifier:
-    """Small deterministic classifier matching the joblib bundle interface."""
+class FakeModel:
+    """Return a fixed number of days for every request."""
 
-    def predict_proba(self, dataframe: Any) -> np.ndarray:
-        """Return a stable high-risk probability for every aggregate row."""
-        return np.array([[0.2, 0.8] for _ in range(len(dataframe))])
+    def __init__(self, days: float) -> None:
+        self.days = days
 
-
-class FakeRepository:
-    """Return one reviewed aggregate row and no raw service-request data."""
-
-    aggregate = {
-        "centroid_lat": 45.4215,
-        "centroid_lon": -75.6972,
-        "line_length_km_water": 1.2,
-        "line_count_water": 2,
-        "line_length_km_road": 1.8,
-        "line_count_road": 3,
-        "building_count": 10,
-        "median_year_built": 1975.0,
-        "pct_pre_1980": 0.6,
-    }
-
-    def get_bbox(self, bbox_values: Any, limit: int) -> RiskMapRows:
-        """Return a small GeoJSON polygon row."""
-        del bbox_values, limit
-        return RiskMapRows(
-            rows=[
-                {
-                    "h3_index": VALID_CELL,
-                    "geometry": {
-                        "type": "Polygon",
-                        "coordinates": [
-                            [
-                                [-75.70, 45.41],
-                                [-75.68, 45.41],
-                                [-75.68, 45.43],
-                                [-75.70, 45.41],
-                            ]
-                        ],
-                    },
-                    "features": self.aggregate,
-                }
-            ],
-            truncated=False,
-        )
-
-    def get_h3(self, h3_index: str) -> dict[str, float | int] | None:
-        """Return aggregate features only for the fixture cell."""
-        return self.aggregate if h3_index == VALID_CELL else None
+    def predict(self, inputs: Any) -> np.ndarray:
+        return np.full(len(inputs), self.days)
 
 
-def fake_predictor() -> RiskPredictor:
-    """Return a predictor with explicit synthetic provenance."""
-    bundle = ModelBundle(
-        model=FakeClassifier(),
-        feature_columns=("line_length_km_water", "heat_index_c"),
-        decision_threshold=0.5,
-        metadata={
-            "artifact_schema_version": 1,
-            "target_mode": "synthetic",
-            "model_version": "test-version",
-        },
+def fake_model(usual: float = 3.0, nine_in_ten: float = 12.0) -> ModelBundle:
+    return ModelBundle(
+        models={"usual_days": FakeModel(usual), "nine_in_ten_days": FakeModel(nine_in_ten)},
+        categories={"type": ["Noise", "Pothole"], "ward": ["1", "2"], "channel": ["Web"]},
+        metadata={"artifact_schema_version": 3, "model_version": "test", "warning": "Closed date."},
     )
-    return RiskPredictor(bundle)
 
 
-def fake_weather() -> dict[str, Any]:
-    """Return one synthetic aggregate weather row."""
-    return {
-        "timestamp": "2024-07-01T12:00:00",
-        "station_name": "SYNTHETIC OTTAWA WEATHER",
-        "temperature_c": 30.0,
-        "relative_humidity": 60.0,
-        "heat_index_c": 32.0,
-        "consecutive_dry_days": 3.0,
-        "rainfall_48h": 0.0,
+def fake_wards() -> dict[str, Any]:
+    square = {
+        "type": "Polygon",
+        "coordinates": [[[-75.7, 45.4], [-75.6, 45.4], [-75.6, 45.5], [-75.7, 45.4]]],
     }
+    return {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "geometry": square,
+                "properties": {"ward": 1, "name": "Somerset", "sector": "Urban"},
+            },
+            {
+                "type": "Feature",
+                "geometry": square,
+                "properties": {"ward": 2, "name": "Kanata North", "sector": "Suburban"},
+            },
+        ],
+    }
+
+
+def fake_requests() -> pd.DataFrame:
+    rows = [("2026-10-30", "2026-10-31", "Noise", 1)] * 120 + [
+        ("2026-10-30", None, "Pothole", 2)
+    ] * 3
+    frame = pd.DataFrame(rows, columns=["opened", "closed", "type", "ward"])
+    frame["opened"] = pd.to_datetime(frame["opened"])
+    frame["closed"] = pd.to_datetime(frame["closed"])
+    frame["ward"] = frame["ward"].astype("Int64")
+    frame["status"] = "Resolved"
+    frame["days_to_close"] = (frame["closed"] - frame["opened"]).dt.days
+    return frame
+
+
+def fake_snapshot() -> Snapshot:
+    return Snapshot(
+        requests=fake_requests(),
+        end=END,
+        batch_types={"Pothole"},
+        request_types=[{"type": "Noise", "category": "Bylaw", "count": 120}],
+        spikes=[
+            {
+                "ward": 1,
+                "ward_name": "Somerset",
+                "type": "Noise",
+                "this_week": 120,
+                "usual_per_week": 2.0,
+            }
+        ],
+        wards=fake_wards(),
+        timed=fake_requests(),
+    )
 
 
 @pytest.fixture(autouse=True)
 def api_dependencies() -> None:
-    """Isolate API tests from local files, models, databases, and the network."""
-    app.dependency_overrides[get_repository] = FakeRepository
-    app.dependency_overrides[get_predictor] = fake_predictor
-    app.dependency_overrides[get_weather_features] = fake_weather
+    """Isolate API tests from local files and models."""
+    app.dependency_overrides[get_model] = fake_model
+    app.dependency_overrides[get_snapshot] = fake_snapshot
     yield
     app.dependency_overrides.clear()
 
@@ -132,131 +120,154 @@ def test_cors_allows_local_origin_not_arbitrary_site() -> None:
     assert "access-control-allow-origin" not in remote.headers
 
 
-def test_weather_summary_is_explicitly_synthetic() -> None:
-    """Weather output labels mock mode instead of presenting a live observation."""
-    response = client.get("/weather-summary")
-    assert response.status_code == 200
-    data = response.json()
-    assert data["temperature_c"] == 30.0
-    assert data["is_synthetic"] is True
-    assert data["forecast_horizon_hours"] == 48
+def test_wards_include_date_and_attribution() -> None:
+    data = client.get("/wards").json()
+    assert data["as_of"] == "2026-10-31"
+    assert "City of Ottawa" in data["attribution"]
+    assert len(data["features"]) == 2
 
 
-def test_metrics_always_warn_about_synthetic_target() -> None:
-    """Model metadata never represents synthetic metrics as operational evidence."""
-    response = client.get("/metrics")
-    assert response.status_code == 200
-    data = response.json()
-    assert "Synthetic" in data["target_warning"]
-    assert data["prediction_horizon_hours"] == 48
+def test_ward_report_card_lists_top_requests_and_spikes() -> None:
+    data = client.get("/wards/1").json()
+    assert data["name"] == "Somerset"
+    assert data["total_requests"] == 120
+    assert data["top_requests"][0]["type"] == "Noise"
+    assert data["spikes"][0]["this_week"] == 120
 
 
-def test_risk_map_returns_bounded_aggregate_geojson() -> None:
-    """Risk map returns H3 aggregates with model provenance."""
-    response = client.get(
-        "/risk-map?min_lon=-75.72&min_lat=45.40&max_lon=-75.68&max_lat=45.44"
-    )
-    assert response.status_code == 200
-    data = response.json()
-    assert data["type"] == "FeatureCollection"
-    assert len(data["features"]) == 1
-    properties = data["features"][0]["properties"]
-    assert properties["risk_score"] == 0.8
-    assert properties["target_mode"] == "synthetic"
-    assert "description" not in properties
-    assert data["metadata"]["truncated"] is False
+@pytest.mark.parametrize("ward", ["0", "25", "abc"])
+def test_ward_report_rejects_unknown_wards(ward: str) -> None:
+    assert client.get(f"/wards/{ward}").status_code == 422
 
 
-def test_risk_map_accepts_bounded_scenario_inputs() -> None:
-    """What-if inputs are labeled in response metadata."""
-    response = client.get(
-        "/risk-map?min_lon=-75.72&min_lat=45.40&max_lon=-75.68&max_lat=45.44"
-        "&sim_temp_c=38.5&sim_humidity=70&sim_dry_days=8"
-    )
-    assert response.status_code == 200
-    assert response.json()["metadata"]["scenario_applied"] is True
+def test_estimate_returns_rounded_days_and_flags() -> None:
+    data = client.get("/estimate", params={"type": "Noise", "ward": 1}).json()
+    assert data["usual_days"] == 3.0
+    assert data["nine_in_ten_days"] == 12.0
+    assert data["batch_closed"] is False
 
 
-@pytest.mark.parametrize(
-    "query, expected_detail",
-    [
-        (
-            "min_lon=-75.60&min_lat=45.40&max_lon=-75.70&max_lat=45.44",
-            "min_lon",
-        ),
-        (
-            "min_lon=-75.70&min_lat=45.50&max_lon=-75.60&max_lat=45.40",
-            "min_lat",
-        ),
-        (
-            "min_lon=-76.35&min_lat=45.25&max_lon=-75.50&max_lat=45.55",
-            "too large",
-        ),
-        (
-            "min_lon=-80&min_lat=45.40&max_lon=-79.9&max_lat=45.44",
-            "Ottawa",
-        ),
-    ],
-)
-def test_risk_map_rejects_unsafe_bbox(query: str, expected_detail: str) -> None:
-    """Reversed, oversized, and out-of-project bboxes fail before storage access."""
-    response = client.get(f"/risk-map?{query}")
-    assert response.status_code == 400
-    assert expected_detail in response.json()["detail"]
+def test_estimate_never_returns_upper_below_usual() -> None:
+    """Separately trained quantiles can cross; the API keeps them ordered."""
+    app.dependency_overrides[get_model] = lambda: fake_model(usual=10.0, nine_in_ten=4.0)
+    data = client.get("/estimate", params={"type": "Noise", "ward": 1}).json()
+    assert data["nine_in_ten_days"] == 10.0
 
 
-def test_risk_map_enforces_server_feature_limit() -> None:
-    """Clients cannot override the configured response-size ceiling."""
-    response = client.get(
-        "/risk-map?min_lon=-75.72&min_lat=45.40&max_lon=-75.68&max_lat=45.44"
-        "&max_features=9999"
-    )
-    assert response.status_code == 400
+def test_estimate_rejects_unknown_types_and_wards() -> None:
+    assert client.get("/estimate", params={"type": "Pothole", "ward": 1}).status_code == 404
+    assert client.get("/estimate", params={"type": "Noise", "ward": 30}).status_code == 422
 
 
-def test_single_h3_returns_aggregate_features() -> None:
-    """A valid present cell returns aggregate inputs and provenance."""
-    response = client.get(f"/risk/{VALID_CELL}")
-    assert response.status_code == 200
-    data = response.json()
-    assert data["risk_score"] == 0.8
-    assert data["features"]["building_count"] == 10
-    assert data["target_mode"] == "synthetic"
-
-
-def test_valid_missing_h3_returns_404() -> None:
-    """A syntactically valid cell absent from storage is a 404."""
-    response = client.get(f"/risk/{MISSING_CELL}")
-    assert response.status_code == 404
-    assert response.json()["detail"] == "H3 cell not found"
-
-
-def test_invalid_h3_returns_422_before_storage() -> None:
-    """Malformed indexes are rejected by request validation."""
-    response = client.get("/risk/not-an-h3-cell")
-    assert response.status_code == 422
+def test_request_types_and_spikes_endpoints() -> None:
+    assert client.get("/request-types").json() == [
+        {"type": "Noise", "category": "Bylaw", "count": 120}
+    ]
+    assert client.get("/spikes").json()["week_ending"] == "2026-10-31"
 
 
 def test_artifact_error_is_generic() -> None:
     """Model failures do not expose paths or Python exception details."""
-    def broken_predictor() -> RiskPredictor:
+
+    def broken_model() -> ModelBundle:
         raise ArtifactError("secret path C:/private/model.joblib")
 
-    app.dependency_overrides[get_predictor] = broken_predictor
-    response = client.get(
-        "/risk-map?min_lon=-75.72&min_lat=45.40&max_lon=-75.68&max_lat=45.44"
-    )
+    app.dependency_overrides[get_model] = broken_model
+    response = client.get("/estimate", params={"type": "Noise", "ward": 1})
     assert response.status_code == 503
-    assert response.json() == {"detail": "Prediction artifacts are unavailable"}
+    assert response.json() == {"detail": "The data is unavailable"}
     assert "private" not in response.text
 
 
-def test_get_risk_level_thresholds() -> None:
-    """Display bands use named constants and exact boundary behavior."""
-    assert get_risk_level(0.85) == "high"
-    assert get_risk_level(0.70) == "high"
-    assert get_risk_level(0.69) == "medium"
-    assert get_risk_level(0.30) == "medium"
-    assert get_risk_level(0.29) == "low"
-    with pytest.raises(ValueError):
-        get_risk_level(float("nan"))
+def test_model_bundle_round_trip_and_validation(tmp_path: Path) -> None:
+    bundle = fake_model()
+    good = {"models": bundle.models, "categories": bundle.categories, "metadata": bundle.metadata}
+    joblib.dump(good, tmp_path / "good.joblib")
+    joblib.dump({**good, "metadata": {"artifact_schema_version": 2}}, tmp_path / "old.joblib")
+
+    assert (
+        load_model_bundle(tmp_path / "good.joblib").estimate("Noise", 1, END)["usual_days"] == 3.0
+    )
+    with pytest.raises(ArtifactError, match="metadata"):
+        load_model_bundle(tmp_path / "old.joblib")
+    with pytest.raises(ArtifactError, match="missing"):
+        load_model_bundle(tmp_path / "absent.joblib")
+
+
+def test_load_snapshot_adds_ward_totals_and_common_types(tmp_path: Path) -> None:
+    requests_path = tmp_path / "requests.csv.gz"
+    frame = fake_requests().drop(columns="days_to_close")
+    frame["category"] = "X"
+    frame["channel"] = "Web"
+    frame.to_csv(requests_path, index=False)
+    wards_path = tmp_path / "wards.geojson"
+    wards_path.write_text(json.dumps(fake_wards()), encoding="utf-8")
+
+    snapshot = load_snapshot(requests_path, wards_path)
+
+    totals = {
+        f["properties"]["ward"]: f["properties"]["total_requests_12_months"]
+        for f in snapshot.wards["features"]
+    }
+    assert totals == {1: 120, 2: 3}
+    assert snapshot.request_types == [{"type": "Noise", "category": "X", "count": 120}]
+    assert snapshot.end == pd.Timestamp("2026-10-30")
+
+
+def test_city_report_card_covers_every_ward_and_spike() -> None:
+    data = client.get("/city").json()
+    assert data["name"] == "All of Ottawa"
+    assert data["ward"] is None
+    assert data["total_requests"] == 123
+    assert len(data["spikes"]) == 1
+
+
+def test_ward_metrics_cover_every_ward_and_filter_by_type() -> None:
+    data = client.get("/ward-metrics").json()
+    assert data["wards"] == [
+        {"ward": 1, "requests": 120, "median_days": 1.0, "spikes": 1},
+        {"ward": 2, "requests": 3, "median_days": None, "spikes": 0},
+    ]
+    noise = client.get("/ward-metrics", params={"type": "Noise"}).json()
+    assert noise["wards"][1] == {"ward": 2, "requests": 0, "median_days": None, "spikes": 0}
+    assert client.get("/ward-metrics", params={"type": "Pothole"}).status_code == 404
+
+
+def test_remaining_reports_thin_history_and_validates_input() -> None:
+    """The fake snapshot has no requests old enough to count, so there is no estimate."""
+    data = client.get("/remaining", params={"type": "Noise", "ward": 1, "waited": 10}).json()
+    assert data["enough_history"] is False
+    assert data["usual_more_days"] is None
+    no_wait = {"type": "Noise", "ward": 1, "waited": 0}
+    rare_type = {"type": "Pothole", "ward": 1, "waited": 5}
+    assert client.get("/remaining", params=no_wait).status_code == 422
+    assert client.get("/remaining", params=rare_type).status_code == 404
+
+
+def test_estimate_for_batch_closed_type_comes_from_history_not_the_model() -> None:
+    recent = pd.DataFrame(
+        {
+            "opened": pd.Timestamp("2026-06-01"),
+            "type": "Pothole",
+            "ward": pd.array([1] * 40, dtype="Int64"),
+            "status": "Resolved",
+            "days_to_close": 4.0,
+        }
+    )
+    snapshot = fake_snapshot()
+    snapshot.request_types.append({"type": "Pothole", "category": "Roads", "count": 400})
+    app.dependency_overrides[get_snapshot] = lambda: Snapshot(
+        snapshot.requests,
+        snapshot.end,
+        snapshot.batch_types,
+        snapshot.request_types,
+        snapshot.spikes,
+        snapshot.wards,
+        timed=recent,
+    )
+    data = client.get("/estimate", params={"type": "Pothole", "ward": 1}).json()
+    assert data["batch_closed"] is True
+    assert (data["usual_days"], data["nine_in_ten_days"]) == (4.0, 4.0)  # the fake model says 3
+    # Types with trustworthy history still use the model.
+    app.dependency_overrides[get_snapshot] = lambda: fake_snapshot()
+    assert client.get("/estimate", params={"type": "Noise", "ward": 2}).json()["usual_days"] == 3.0
