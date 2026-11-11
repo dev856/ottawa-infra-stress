@@ -1,12 +1,16 @@
 {
-  "name": "ottawa-infra-stress-frontend",
-  "version": "1.0.0",
-  "description": "MapLibre dashboard for Ottawa Infrastructure Stress Predictor",
+  "name": "ottawa-311-insights-frontend",
+  "version": "4.0.0",
+  "private": true,
+  "description": "MapLibre dashboard for Ottawa 311 Insights",
   "scripts": {
+    "build": "tsc",
+    "check": "tsc --noEmit",
     "start": "npx http-server -p 3000 -c-1"
   },
-  "dependencies": {
-    "http-server": "^14.1.1"
-  },
-  "devDependencies": {}
+  "devDependencies": {
+    "@types/geojson": "7946.0.16",
+    "maplibre-gl": "5.24.0",
+    "typescript": "5.9.3"
+  }
 }

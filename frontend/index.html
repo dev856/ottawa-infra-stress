@@ -5,332 +5,165 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta
         http-equiv="Content-Security-Policy"
-        content="default-src 'self'; script-src 'self' https://unpkg.com; style-src 'self' 'unsafe-inline' https://unpkg.com; connect-src 'self' http://127.0.0.1:8000 http://localhost:8000; img-src 'self' data: blob:; worker-src blob:; object-src 'none'; base-uri 'none'; form-action 'none'"
+        content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' http://127.0.0.1:8000 http://localhost:8000; img-src 'self' data: blob:; worker-src blob:; object-src 'none'; base-uri 'none'; form-action 'none'"
     >
     <meta
         name="description"
-        content="Local synthetic demonstration of H3-level Ottawa infrastructure stress risk."
+        content="What Ottawa residents report to 311 in each ward, how long requests take to close, and what is unusual this week. Built on City of Ottawa open data."
     >
-    <title>Ottawa Infrastructure Stress — Synthetic Demo</title>
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>💧</text></svg>">
+    <title>Ottawa 311 Insights</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📞</text></svg>">
     <link
         rel="stylesheet"
-        href="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.css"
+        href="vendor/maplibre-gl.css"
         integrity="sha384-uTttxo/aOKbdE5RlD/SPzSDoDmNvGlUYPjONi2MN/b7c9HPSvW07OIuyP7uL6jxK"
         crossorigin="anonymous"
     >
     <link rel="stylesheet" href="styles.css">
     <script
         defer
-        src="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.js"
+        src="vendor/maplibre-gl.js"
         integrity="sha384-5+cfbwT0iiub6VsQAdn6yz16nr6sDiQoHx6tm4O8OVYXHYOxcffFmCJBL0dgdvGp"
         crossorigin="anonymous"
     ></script>
-    <script defer src="app.js"></script>
+    <script type="module" src="dist/app.js"></script>
 </head>
 <body>
     <header class="site-header">
         <div>
-            <p class="eyebrow">Local educational project</p>
-            <h1>Ottawa infrastructure stress</h1>
-            <p class="subtitle">Aggregate H3 risk explorer · 48-hour demonstration horizon</p>
+            <h1>Ottawa 311 insights</h1>
+            <p class="subtitle">What your ward reports, how long the City takes to close requests, and what's unusual this week.</p>
         </div>
         <div class="header-actions">
             <button id="open-guide" class="guide-toggle-btn" type="button" aria-haspopup="dialog">
-                📖 How to Read &amp; Interpret
+                📖 How it works
             </button>
             <div id="api-status" class="status status-loading" role="status" aria-live="polite">
-                Connecting to local API…
+                Connecting…
             </div>
         </div>
     </header>
 
     <div class="warning-banner" role="note">
-        <strong>Synthetic demonstration.</strong>
-        This is not a live municipal forecast and must not be used for emergency,
-        maintenance, or public-safety decisions.
+        <strong>Not an official City service.</strong>
+        Built from City of Ottawa 311 open data<span id="as-of"></span>. "Closed" means the City marked the request closed, which is not always when the work was done.
     </div>
 
     <main class="app-shell">
-        <aside class="control-panel" aria-label="Risk map controls">
+        <aside class="control-panel" aria-label="Find out how long a request takes">
             <section class="panel-section">
-                <div class="section-heading">
-                    <h2>Weather inputs</h2>
-                    <span id="weather-mode" class="tag">Loading</span>
-                </div>
-                <dl class="metric-grid">
-                    <div>
-                        <dt>Temperature</dt>
-                        <dd id="weather-temperature">—</dd>
-                    </div>
-                    <div>
-                        <dt>Heat index</dt>
-                        <dd id="weather-heat-index">—</dd>
-                    </div>
-                    <div>
-                        <dt>Dry days</dt>
-                        <dd id="weather-dry-days">—</dd>
-                    </div>
-                    <div>
-                        <dt>Rain, 48 h</dt>
-                        <dd id="weather-rainfall">—</dd>
-                    </div>
-                </dl>
-                <p id="weather-observed-at" class="supporting-text">No weather row loaded.</p>
+                <h2><span class="step">1</span> Choose your ward</h2>
+                <select id="ward-picker" aria-label="Your ward">
+                    <option value="">All of Ottawa</option>
+                </select>
+                <p class="supporting-text">Or click your area on the map.</p>
             </section>
 
             <section class="panel-section">
-                <h2>Visible aggregates</h2>
-                <dl class="metric-grid compact">
-                    <div>
-                        <dt>H3 cells</dt>
-                        <dd id="cell-count">0</dd>
-                    </div>
-                    <div>
-                        <dt>High band</dt>
-                        <dd id="high-count">0</dd>
-                    </div>
-                    <div>
-                        <dt>Average</dt>
-                        <dd id="average-risk">—</dd>
-                    </div>
-                    <div>
-                        <dt>Maximum</dt>
-                        <dd id="maximum-risk">—</dd>
-                    </div>
-                </dl>
-                <p id="model-provenance" class="supporting-text">Model provenance unavailable.</p>
-            </section>
-
-            <section class="panel-section">
-                <h2>Map canvas theme</h2>
-                <div class="view-selector" role="radiogroup" aria-label="Base canvas theme">
-                    <button id="view-neutral" class="view-btn active" type="button" role="radio" aria-checked="true" data-view="neutral">
-                        🗺️ Neutral
-                    </button>
-                    <button id="view-dark" class="view-btn" type="button" role="radio" aria-checked="false" data-view="dark">
-                        🌙 Dark
-                    </button>
-                    <button id="view-slate" class="view-btn" type="button" role="radio" aria-checked="false" data-view="slate">
-                        🏙️ Slate
-                    </button>
-                    <button id="view-terrain" class="view-btn" type="button" role="radio" aria-checked="false" data-view="terrain">
-                        🌿 Terrain
-                    </button>
+                <h2><span class="step">2</span> What would you report?</h2>
+                <select id="type-picker" aria-label="Request type">
+                    <option value="">Choose a problem…</option>
+                </select>
+                <div id="estimate-card" class="estimate-card hidden" aria-live="polite">
+                    <span class="eyebrow-light">How long it usually takes</span>
+                    <strong id="estimate-usual"></strong>
+                    <span id="estimate-range"></span>
                 </div>
-
-                <label for="risk-filter">
-                    Minimum risk score
-                    <output id="risk-filter-value" for="risk-filter">0%</output>
-                </label>
-                <input id="risk-filter" type="range" min="0" max="90" step="5" value="0">
-
-                <label for="opacity-filter">
-                    Hexagon opacity
-                    <output id="opacity-filter-value" for="opacity-filter">70%</output>
-                </label>
-                <input id="opacity-filter" type="range" min="20" max="100" step="5" value="70">
-
-                <div class="legend" aria-label="Risk score legend">
-                    <span>Low &lt; 30%</span>
-                    <span>Medium 30–69%</span>
-                    <span>High ≥ 70%</span>
-                </div>
-            </section>
-
-            <section class="panel-section scenario-section">
-                <div class="section-heading">
-                    <h2>What-if scenario</h2>
-                    <span class="tag tag-neutral">Optional</span>
-                </div>
-                <p class="supporting-text">
-                    Recalculate demo scores with bounded city-wide assumptions.
+                <p id="estimate-batch" class="batch-note hidden">
+                    ⚠️ The City closed older requests of this kind in one bulk clean-up, so their closing dates are not real. This is based only on requests reported since then, which is a short history.
                 </p>
-                <label for="scenario-temperature">
-                    Temperature
-                    <output id="scenario-temperature-value" for="scenario-temperature">34 °C</output>
-                </label>
-                <input id="scenario-temperature" type="range" min="20" max="42" step="0.5" value="34">
-
-                <label for="scenario-humidity">
-                    Relative humidity
-                    <output id="scenario-humidity-value" for="scenario-humidity">65%</output>
-                </label>
-                <input id="scenario-humidity" type="range" min="20" max="95" step="5" value="65">
-
-                <label for="scenario-dry-days">
-                    Consecutive dry days
-                    <output id="scenario-dry-days-value" for="scenario-dry-days">6</output>
-                </label>
-                <input id="scenario-dry-days" type="range" min="0" max="30" step="1" value="6">
-
-                <div class="button-row">
-                    <button id="apply-scenario" type="button">Apply scenario</button>
-                    <button id="reset-scenario" class="secondary-button" type="button">Reset</button>
+                <div id="waited-block" class="hidden">
+                    <label for="waited-input">Already reported it? Days you've waited so far</label>
+                    <input id="waited-input" type="number" min="1" max="365" step="1" inputmode="numeric" placeholder="For example, 10">
+                    <p id="remaining-text" class="batch-note hidden" aria-live="polite"></p>
                 </div>
-            </section>
-
-            <section class="panel-section">
-                <h2>Model status</h2>
-                <p id="model-warning" class="supporting-text">
-                    Synthetic target metrics do not measure real-world performance.
-                </p>
-                <dl class="detail-list">
-                    <div><dt>PR-AUC</dt><dd id="metric-pr-auc">—</dd></div>
-                    <div><dt>F1 at threshold</dt><dd id="metric-f1">—</dd></div>
-                    <div><dt>Decision threshold</dt><dd id="metric-threshold">—</dd></div>
-                </dl>
             </section>
 
             <div id="error-message" class="error-message hidden" role="alert"></div>
         </aside>
 
-        <section class="map-panel" aria-label="Ottawa H3 aggregate risk map">
-            <div class="map-top-bar">
-                <span class="quick-jump-label">📍 Quick jump:</span>
-                <div class="quick-jump-buttons">
-                    <button class="jump-btn" type="button" data-lng="-75.6972" data-lat="45.4215" data-zoom="13.2">
-                        🏛️ Downtown Core
-                    </button>
-                    <button class="jump-btn" type="button" data-lng="-75.8986" data-lat="45.3188" data-zoom="13.0">
-                        🌲 Kanata Suburbs
-                    </button>
-                    <button class="jump-btn" type="button" data-lng="-75.5200" data-lat="45.4750" data-zoom="13.0">
-                        🏘️ Orléans East
-                    </button>
-                    <button class="jump-btn" type="button" data-lng="-75.7600" data-lat="45.3200" data-zoom="12.8">
-                        🌳 Nepean / Greenbelt
-                    </button>
-                </div>
-            </div>
-            <div id="map" aria-label="Interactive risk map"></div>
+        <section class="map-panel" aria-label="Ottawa ward map">
+            <div id="map" aria-label="Map of Ottawa wards shaded by 311 requests"></div>
             <div id="loading-message" class="map-message" role="status" aria-live="polite">
-                Loading aggregate H3 cells…
+                Loading map…
             </div>
-            <div class="map-note">
-                Locally styled vector canvas. No third-party tile services or location requests.
+            <select id="metric-picker" class="map-metric" aria-label="Colour the map by">
+                <option value="requests">Colour by: number of requests</option>
+                <option value="median_days">Colour by: days to close</option>
+                <option value="spikes">Colour by: unusual this week</option>
+            </select>
+            <div class="map-legend">
+                <strong id="legend-title"></strong>
+                <div id="legend-bands" class="legend"></div>
             </div>
         </section>
 
-        <aside id="cell-details" class="detail-panel" aria-label="Selected H3 cell">
-            <p class="eyebrow">Selected aggregate</p>
-            <h2>H3 cell details</h2>
-            <p id="selected-h3" class="mono">Select a hexagon on the map.</p>
-            <div class="score-card">
-                <span id="selected-level">No score</span>
-                <strong id="selected-score">—</strong>
-            </div>
+        <aside id="cell-details" class="detail-panel" aria-label="Report card">
+            <p class="eyebrow">Report card</p>
+            <h2 id="selected-name">All of Ottawa</h2>
+            <p id="selected-summary" class="supporting-text"></p>
+            <table id="report-table" class="report-table">
+                <caption>What people report most (last 12 months)</caption>
+                <thead>
+                    <tr><th scope="col">Problem</th><th scope="col">Reports</th><th scope="col">Usually closed</th></tr>
+                </thead>
+                <tbody id="report-rows"></tbody>
+            </table>
 
-            <div id="density-badge-container" class="density-badge-row hidden">
-                <span id="density-badge" class="badge">Urban Density</span>
-                <span id="demand-badge" class="badge">Asset Density</span>
-            </div>
-
-            <dl class="detail-list">
-                <div><dt>Water mains</dt><dd id="selected-water">—</dd></div>
-                <div><dt>Roads</dt><dd id="selected-roads">—</dd></div>
-                <div><dt>Building count</dt><dd id="selected-buildings">—</dd></div>
-                <div><dt>Median year built</dt><dd id="selected-year">—</dd></div>
-                <div><dt>Pre-1980 building share</dt><dd id="selected-vintage">—</dd></div>
-            </dl>
-
-            <div id="vintage-breakdown" class="vintage-progress-container hidden">
-                <div class="vintage-progress-labels">
-                    <span>Pre-1980 Buildings (<strong id="vintage-pre-pct">0%</strong>)</span>
-                    <span>Modern (<strong id="vintage-post-pct">100%</strong>)</span>
-                </div>
-                <div class="vintage-progress-bar">
-                    <div id="vintage-bar-fill" class="vintage-bar-fill" style="width: 0%;"></div>
-                </div>
-            </div>
-
-            <p id="selected-provenance" class="supporting-text"></p>
+            <h3 class="spike-heading">Unusual this week</h3>
+            <p class="supporting-text">Much more of one problem than in the previous 8 weeks.</p>
+            <ul id="spike-list" class="spike-list"></ul>
+            <button id="show-all-spikes" class="secondary-button hidden" type="button"></button>
         </aside>
     </main>
 
     <dialog id="guide-dialog" class="guide-dialog" aria-labelledby="guide-title">
         <div class="guide-dialog-content">
             <div class="guide-dialog-header">
-                <div>
-                    <p class="eyebrow">Interactive Explainer</p>
-                    <h2 id="guide-title">Understanding the Ottawa Infrastructure Stress Simulation</h2>
-                </div>
+                <h2 id="guide-title">How it works</h2>
                 <button id="close-guide" class="dialog-close-btn" type="button" aria-label="Close guide">✕</button>
             </div>
-
             <div class="guide-dialog-body">
                 <section class="guide-card">
-                    <h3>1. The Domain: Why Summer Infrastructure Stress?</h3>
+                    <h3>Where the data comes from</h3>
                     <p>
-                        While winter pipe freezes are well known, <strong>summer heatwaves and dry spells</strong> create critical soil and hydraulic stress in the Ottawa region:
-                    </p>
-                    <ul>
-                        <li><strong>Leda Clay Soil Shrinkage:</strong> Ottawa sits on sensitive marine clay that desiccates and shrinks during prolonged dry spells, shifting underground soils and exerting shear forces on pipe networks.</li>
-                        <li><strong>Vintage Building &amp; Infrastructure Proxy:</strong> Older neighborhoods developed before 1980 typically correlate with legacy cast-iron and ductile-iron utility installations that are more brittle under ground settlement.</li>
-                        <li><strong>Atmospheric &amp; Demand Strain:</strong> Sustained high heat indexes accelerate evaporation and drive high municipal water distribution demand.</li>
-                    </ul>
-                    <p class="guide-highlight">
-                        <strong>Project Purpose:</strong> Provide an extensible educational simulation and machine learning pipeline demonstrating how geospatial aggregation (Uber H3) and environmental features can model infrastructure vulnerability.
+                        Every request residents made to Ottawa's 311 service since January 2025, published by the City
+                        as open data. Only the dates, request type, ward, and how it was submitted are used: no addresses.
                     </p>
                 </section>
-
                 <section class="guide-card">
-                    <h3>2. How to Read the Map</h3>
+                    <h3>Ward report card</h3>
                     <p>
-                        The map aggregates Ottawa into <strong>Uber H3 hexagons</strong> (Resolution 8, ~0.73 km² per cell — neighborhood block resolution).
+                        The map shades each ward by its number of 311 requests in the last 12 months. Use the menu on
+                        the map to shade by typical days to close or by unusual jumps instead, and choose a problem in
+                        step 2 to see the map for just that problem. Click a ward to see
+                        what its residents report most, and how many days those requests typically take to close there
+                        compared with the whole city. These are counts from City records, not predictions.
                     </p>
-                    <div class="guide-risk-bands">
-                        <div class="risk-band-item band-low">
-                            <span class="badge badge-low">Low (&lt; 30%)</span>
-                            <p><strong>Baseline stability.</strong> Low linear asset density, modern building vintage, or mild environmental conditions.</p>
-                        </div>
-                        <div class="risk-band-item band-med">
-                            <span class="badge badge-med">Medium (30–69%)</span>
-                            <p><strong>Moderate stress.</strong> Moderate building age, increased linear pipe exposure, or emerging dry weather.</p>
-                        </div>
-                        <div class="risk-band-item band-high">
-                            <span class="badge badge-high">High (≥ 70%)</span>
-                            <p><strong>Elevated vulnerability hotspot.</strong> High concentration of pre-1980 legacy structures combined with severe dry/heat conditions.</p>
-                        </div>
-                    </div>
                 </section>
-
                 <section class="guide-card">
-                    <h3>3. Key Feature Inputs Explained</h3>
-                    <div class="guide-grid">
-                        <div class="guide-grid-item">
-                            <h4>🚰 Water Mains (km)</h4>
-                            <p>Total linear kilometers of water distribution mains within the H3 cell.</p>
-                        </div>
-                        <div class="guide-grid-item">
-                            <h4>🏛️ Pre-1980 Building Vintage (%)</h4>
-                            <p>Proportion of building footprints constructed before 1980, serving as an urban age proxy.</p>
-                        </div>
-                        <div class="guide-grid-item">
-                            <h4>🌡️ Heat Index (°C)</h4>
-                            <p>Atmospheric heat metric combining temperature and relative humidity.</p>
-                        </div>
-                        <div class="guide-grid-item">
-                            <h4>☀️ Consecutive Dry Days</h4>
-                            <p>Cumulative days without precipitation (&lt; 1 mm), correlating with soil desiccation.</p>
-                        </div>
-                    </div>
+                    <h3>How long will my request take?</h3>
+                    <p>
+                        A machine-learning model trained on over 350,000 closed requests estimates the usual time to close,
+                        and a time that 9 in 10 similar requests close within. Tested on requests it had never seen, about
+                        90% closed within the "9 in 10" time. For types marked ⚠️ the answer is read from recent requests instead. If you have already reported it, enter how many days you
+                        have waited: the answer then comes from past requests that were still open after that long.
+                    </p>
                 </section>
-
                 <section class="guide-card">
-                    <h3>4. Scenario Simulator ("What-if")</h3>
-                    <ol class="guide-steps">
-                        <li>Locate the <strong>What-if scenario</strong> panel on the left sidebar.</li>
-                        <li>Adjust the <strong>Temperature</strong> and <strong>Consecutive dry days</strong> sliders.</li>
-                        <li>Click <strong>Apply scenario</strong> to recompute risk scores across the visible grid.</li>
-                        <li>Click any hexagon on the map to inspect its infrastructure features.</li>
-                    </ol>
+                    <h3>Unusual this week</h3>
+                    <p>
+                        A request type is flagged when a ward gets at least 5 this week, at least 3 times its usual weekly
+                        number, and a jump that size would almost never happen by chance. A cluster of leak or street-light
+                        reports can be an early sign of one larger problem.
+                    </p>
                 </section>
-
                 <section class="guide-card guide-card-muted">
-                    <h3>5. Simulation Notice &amp; Data Provenance</h3>
+                    <h3>What this can't tell you</h3>
                     <p>
-                        This system operates in <strong>synthetic simulation mode</strong>. Training targets and mock features are generated for local offline development. It is an educational engineering prototype, not an operational municipal dispatch tool.
+                        "Closed" is when the City marked a request closed. In May 2026 the City closed about 130,000 old
+                        requests in one bulk clean-up, so for about half the request types the older closing dates are not
+                        real. Those types are marked ⚠️, and their times use only requests reported after the clean-up.
                     </p>
                 </section>
             </div>
@@ -338,9 +171,8 @@
     </dialog>
 
     <footer class="site-footer">
-        <span>Map rendering: MapLibre GL JS (BSD-3-Clause).</span>
-        <span>No analytics, cookies, paid tokens, or third-party map tiles.</span>
-        <span>Source review: repository DATA_LICENSES.md.</span>
+        <span id="attribution">Contains information licensed under the Open Government Licence – City of Ottawa.</span>
+        <span>Not affiliated with or endorsed by the City of Ottawa. Map: MapLibre GL JS (BSD-3-Clause). No tracking or cookies.</span>
     </footer>
 </body>
 </html>

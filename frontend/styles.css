@@ -132,7 +132,7 @@ input {
 
 .app-shell {
     display: grid;
-    grid-template-columns: 320px minmax(420px, 1fr) 280px;
+    grid-template-columns: 300px minmax(420px, 1fr) 360px;
     gap: 14px;
     min-height: calc(100vh - 175px);
     padding: 14px;
@@ -278,26 +278,154 @@ input[type="range"] {
     accent-color: var(--brand);
 }
 
+/* Colours match BAND_COLOURS in src/app.ts. */
 .legend {
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
+    grid-template-columns: repeat(4, 1fr);
     gap: 4px;
-    margin-top: 12px;
-    font-size: 0.63rem;
+    font-size: 0.68rem;
     text-align: center;
 }
 
 .legend span {
-    padding-top: 7px;
-    border-top: 5px solid var(--low);
+    padding-top: 6px;
+    border-top: 6px solid #c9e3d6;
 }
 
 .legend span:nth-child(2) {
-    border-color: var(--medium);
+    border-color: #7fbf9f;
 }
 
 .legend span:nth-child(3) {
-    border-color: var(--high);
+    border-color: #3d8f6b;
+}
+
+.legend span:nth-child(4) {
+    border-color: #1f5c43;
+}
+
+.map-legend {
+    position: absolute;
+    left: 12px;
+    bottom: 12px;
+    width: min(320px, calc(100% - 24px));
+    padding: 8px 10px;
+    background: var(--surface);
+    border-radius: 8px;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.15);
+    z-index: 5;
+}
+
+.map-legend strong {
+    display: block;
+    margin-bottom: 4px;
+    font-size: 0.68rem;
+}
+
+.map-metric {
+    position: absolute;
+    top: 12px;
+    left: 12px;
+    max-width: calc(100% - 70px);
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.15);
+    z-index: 5;
+}
+
+#waited-input {
+    width: 100%;
+}
+
+.estimate-card {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-top: 12px;
+    padding: 14px;
+    color: #fff;
+    background: var(--brand);
+    border-radius: 10px;
+}
+
+.estimate-card strong {
+    font-size: 1.2rem;
+}
+
+.batch-note {
+    margin-top: 8px;
+    font-size: 0.8rem;
+    color: var(--text);
+}
+
+.spike-list {
+    display: grid;
+    gap: 6px;
+    margin: 8px 0 0;
+    padding: 0;
+    list-style: none;
+}
+
+.spike-item {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    width: 100%;
+    text-align: left;
+    color: var(--text);
+    background: var(--surface-muted);
+    border: 1px solid var(--border);
+}
+
+.spike-item span {
+    font-size: 0.78rem;
+    font-weight: 400;
+    color: var(--muted);
+}
+
+.report-table {
+    width: 100%;
+    margin-top: 12px;
+    border-collapse: collapse;
+    font-size: 0.82rem;
+}
+
+.report-table caption {
+    margin-bottom: 6px;
+    font-weight: 700;
+    text-align: left;
+}
+
+.report-table th,
+.report-table td {
+    padding: 6px 4px;
+    text-align: left;
+    vertical-align: top;
+    border-bottom: 1px solid var(--border);
+}
+
+.report-table th:not(:first-child),
+.report-table td:not(:first-child) {
+    text-align: right;
+}
+
+.report-table th:nth-child(2) {
+    width: 4.5em;
+}
+
+.report-table th:nth-child(3) {
+    width: 6.5em;
+}
+
+#type-picker,
+#ward-picker,
+#metric-picker,
+#waited-input {
+    padding: 5px 8px;
+    font: inherit;
+    font-size: 0.85rem;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface);
+    color: var(--text);
 }
 
 .button-row {
@@ -748,4 +876,61 @@ button:hover {
     #map {
         min-height: 500px;
     }
+}
+
+#type-picker {
+    width: 100%;
+    margin-top: 4px;
+}
+
+.step {
+    display: inline-grid;
+    place-items: center;
+    width: 1.5em;
+    height: 1.5em;
+    margin-right: 6px;
+    font-size: 0.85em;
+    color: #fff;
+    background: var(--brand);
+    border-radius: 50%;
+}
+
+#ward-picker {
+    width: 100%;
+    margin: 6px 0 4px;
+}
+
+.eyebrow-light {
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    opacity: 0.85;
+}
+
+.report-table small,
+.report-table td small {
+    display: block;
+    font-size: 0.72rem;
+    color: var(--muted);
+}
+
+.spike-heading {
+    margin: 22px 0 2px;
+}
+
+.spike-title {
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+    justify-content: space-between;
+}
+
+.spike-title .badge {
+    flex-shrink: 0;
+}
+
+#show-all-spikes {
+    width: 100%;
+    margin-top: 8px;
 }
